@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef } from "react";
+import type { MutableRefObject } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { Line, OrbitControls } from "@react-three/drei";
@@ -19,12 +20,15 @@ import {
 import { hashStringToSeed } from "./rng";
 import {
   FOG_CELL_SIZE,
+  cellIndexForPosition,
   createFogOfWar,
   revealFogAround,
   fogCellCenter,
   type FogOfWarState,
 } from "./fogOfWar";
 import { generateRobots, sampleRobotPosition, type RescueRobot } from "./robots";
+import TelemetryTracker from "./TelemetryTracker";
+import type { RobotPositions, TelemetrySnapshot } from "./telemetry";
 
 /** Deterministic 0..1 float derived from a string id (no Math.random). */
 function phaseFromId(id: string): number {
@@ -44,6 +48,14 @@ export {
   type BiomeSample,
 } from "./generateDisasterMap";
 export type { RescueRobot } from "./robots";
+export type {
+  FeedEntry,
+  FeedKind,
+  FeedSeverity,
+  RobotTask,
+  RobotTelemetry,
+  TelemetrySnapshot,
+} from "./telemetry";
 
 // ---------------------------------------------------------------------------
 // Palette - colorful biomes, still dark & technical at the edges/hazards
@@ -476,11 +488,13 @@ function RobotUnit({
   map,
   fog,
   showRadius,
+  positionsRef,
 }: {
   robot: RescueRobot;
   map: GeneratedDisasterMap;
   fog: FogOfWarState;
   showRadius: boolean;
+  positionsRef: MutableRefObject<RobotPositions>;
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const bodyRef = useRef<THREE.Mesh>(null);
@@ -496,6 +510,10 @@ function RobotUnit({
     // Keep clearing fog every frame regardless of whether the radius ring
     // is currently shown - the toggle only affects the visual, not the sim.
     revealFogAround(fog, x, z, robot.radius, delta);
+
+    // Publish the live position for the HUD telemetry pass (TelemetryTracker)
+    // to read at its own throttled rate - a plain ref write, no React state.
+    positionsRef.current[robot.id] = { x, z };
 
     if (groupRef.current) groupRef.current.position.set(x, groundY, z);
     if (bodyRef.current) {
@@ -542,16 +560,25 @@ function RescueRobots({
   map,
   fog,
   showRadius,
+  positionsRef,
 }: {
   robots: RescueRobot[];
   map: GeneratedDisasterMap;
   fog: FogOfWarState;
   showRadius: boolean;
+  positionsRef: MutableRefObject<RobotPositions>;
 }) {
   return (
     <>
       {robots.map((robot) => (
-        <RobotUnit key={robot.id} robot={robot} map={map} fog={fog} showRadius={showRadius} />
+        <RobotUnit
+          key={robot.id}
+          robot={robot}
+          map={map}
+          fog={fog}
+          showRadius={showRadius}
+          positionsRef={positionsRef}
+        />
       ))}
     </>
   );
@@ -651,13 +678,27 @@ function Scene({
   robots,
   fog,
   showExplorationRadius,
+  showHazards,
+  showRoutes,
+  showBlockedPaths,
   onEntityClick,
+  positionsRef,
+  cellEntities,
+  sessionStartRef,
+  onTelemetryUpdate,
 }: {
   map: GeneratedDisasterMap;
   robots: RescueRobot[];
   fog: FogOfWarState;
   showExplorationRadius: boolean;
+  showHazards: boolean;
+  showRoutes: boolean;
+  showBlockedPaths: boolean;
   onEntityClick?: (entity: MapEntity) => void;
+  positionsRef: MutableRefObject<RobotPositions>;
+  cellEntities: Map<number, MapEntity[]>;
+  sessionStartRef: MutableRefObject<number>;
+  onTelemetryUpdate?: (snapshot: TelemetrySnapshot) => void;
 }) {
   const handleClick = (entity: MapEntity) => (event: ThreeEvent<MouseEvent>) => {
     event.stopPropagation();
@@ -694,31 +735,48 @@ function Scene({
       <gridHelper args={[MAP_SIZE, 40, "#2c3a4a", "#1a2230"]} position={[0, 0.02, 0]} />
 
       <Terrain map={map} />
-      <RouteLines map={map} />
+      {showRoutes && <RouteLines map={map} />}
 
       {map.rubble.map((r) => (
         <group key={r.id} onClick={handleClick(r)}>
           <RubblePile entity={r} map={map} />
         </group>
       ))}
-      {map.blockedPaths.map((r) => (
-        <group key={r.id} onClick={handleClick(r)}>
-          <RubblePile entity={r} map={map} blocked />
-        </group>
-      ))}
-      {map.hazards.map((h) => (
-        <group key={h.id} onClick={handleClick(h)}>
-          <HazardMarker entity={h} />
-        </group>
-      ))}
+      {showBlockedPaths &&
+        map.blockedPaths.map((r) => (
+          <group key={r.id} onClick={handleClick(r)}>
+            <RubblePile entity={r} map={map} blocked />
+          </group>
+        ))}
+      {showHazards &&
+        map.hazards.map((h) => (
+          <group key={h.id} onClick={handleClick(h)}>
+            <HazardMarker entity={h} />
+          </group>
+        ))}
       {map.survivors.map((s) => (
         <group key={s.id} onClick={handleClick(s)}>
           <SurvivorMarker entity={s} />
         </group>
       ))}
 
-      <RescueRobots robots={robots} map={map} fog={fog} showRadius={showExplorationRadius} />
+      <RescueRobots
+        robots={robots}
+        map={map}
+        fog={fog}
+        showRadius={showExplorationRadius}
+        positionsRef={positionsRef}
+      />
       <FogOfWar map={map} fog={fog} />
+      <TelemetryTracker
+        map={map}
+        robots={robots}
+        fog={fog}
+        positionsRef={positionsRef}
+        cellEntities={cellEntities}
+        sessionStartRef={sessionStartRef}
+        onTelemetryUpdate={onTelemetryUpdate}
+      />
 
       <TacticalOrbitControls />
     </>
@@ -744,6 +802,18 @@ export interface DisasterMap3DProps {
   showExplorationRadius?: boolean;
   /** Fired once per generation with the deterministic rescue-robot roster (positions/paths/radius all derive from the same seed). */
   onRobotsGenerated?: (robots: RescueRobot[]) => void;
+  /** Show/hide the structural hazard markers (ember/wireframe warnings). Defaults to true. */
+  showHazards?: boolean;
+  /** Show/hide the glowing clear-corridor route lines. Defaults to true. */
+  showRoutes?: boolean;
+  /** Show/hide the deliberately-dumped rubble piles blocking corridors. Defaults to true. */
+  showBlockedPaths?: boolean;
+  /**
+   * Fired at a throttled ~4Hz with the latest mission telemetry (survivor
+   * found/pending count, per-robot battery/signal/task, and any newly
+   * detected hazard/survivor feed entries) - see TelemetryTracker.tsx.
+   */
+  onTelemetryUpdate?: (snapshot: TelemetrySnapshot) => void;
   className?: string;
 }
 
@@ -753,6 +823,10 @@ export default function DisasterMap3D({
   onEntityClick,
   showExplorationRadius = false,
   onRobotsGenerated,
+  showHazards = true,
+  showRoutes = true,
+  showBlockedPaths = true,
+  onTelemetryUpdate,
   className,
 }: DisasterMap3DProps) {
   const map = useMemo(() => generateDisasterMap(seed), [seed]);
@@ -765,6 +839,33 @@ export default function DisasterMap3D({
     [seed, robots]
   );
 
+  // One-time reverse lookup (per map) from fog-cell index -> the
+  // hazard/blocked-path/survivor entities sitting in it, so
+  // TelemetryTracker's reveal-event scan is O(revealed cells) instead of
+  // O(cells * entities) every frame. Deliberately excludes plain rubble -
+  // logging every rubble block would spam the feed, per the HUD spec.
+  const cellEntities = useMemo(() => {
+    const lookup = new Map<number, MapEntity[]>();
+    for (const entity of [...map.hazards, ...map.blockedPaths, ...map.survivors]) {
+      const idx = cellIndexForPosition(entity.position[0], entity.position[2]);
+      const bucket = lookup.get(idx);
+      if (bucket) bucket.push(entity);
+      else lookup.set(idx, [entity]);
+    }
+    return lookup;
+  }, [map]);
+
+  // Live per-robot [x, z], written every frame by RobotUnit and read
+  // (throttled) by TelemetryTracker - a plain ref, never React state, so
+  // 60fps position updates never trigger a re-render on their own.
+  const positionsRef = useRef<RobotPositions>({});
+  // Wall-clock session start for this seed, driving battery drain / feed
+  // timestamps - resets whenever the seed (and therefore the whole map)
+  // changes, matching the HUD's mission clock reset behavior. `Date.now()`
+  // is deliberately called inside the effect below (never directly during
+  // render) so it stays a pure render pass.
+  const sessionStartRef = useRef<number>(0);
+
   useEffect(() => {
     onGenerated?.(map);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -774,6 +875,11 @@ export default function DisasterMap3D({
     onRobotsGenerated?.(robots);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [robots]);
+
+  useEffect(() => {
+    sessionStartRef.current = Date.now();
+    positionsRef.current = {};
+  }, [seed]);
 
   return (
     <div className={className} style={{ width: "100%", height: "100%" }}>
@@ -788,7 +894,14 @@ export default function DisasterMap3D({
           robots={robots}
           fog={fog}
           showExplorationRadius={showExplorationRadius}
+          showHazards={showHazards}
+          showRoutes={showRoutes}
+          showBlockedPaths={showBlockedPaths}
           onEntityClick={onEntityClick}
+          positionsRef={positionsRef}
+          cellEntities={cellEntities}
+          sessionStartRef={sessionStartRef}
+          onTelemetryUpdate={onTelemetryUpdate}
         />
       </Canvas>
     </div>

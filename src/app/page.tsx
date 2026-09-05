@@ -11,16 +11,23 @@ import {
   HeartPulse,
   Leaf,
   Radar,
-  Radio,
   Route as RouteIcon,
 } from "lucide-react";
 
 import type {
+  FeedEntry,
   GeneratedDisasterMap,
   MapEntity,
   RescueRobot,
+  RobotTelemetry,
+  TelemetrySnapshot,
 } from "@/components/disaster-map/DisasterMap3D";
 import SeedControlPanel from "@/components/disaster-map/SeedControlPanel";
+import TopHudBar from "@/components/hud/TopHudBar";
+import RobotFleetDrawer from "@/components/hud/RobotFleetDrawer";
+import HazardFeedDrawer from "@/components/hud/HazardFeedDrawer";
+import FilterTogglesBar from "@/components/hud/FilterTogglesBar";
+import { useCommsStability } from "@/components/hud/useCommsStability";
 
 const DisasterMap3D = dynamic(
   () => import("@/components/disaster-map/DisasterMap3D"),
@@ -28,6 +35,16 @@ const DisasterMap3D = dynamic(
 );
 
 const DEFAULT_SEED = "QUAKE-7821";
+/** Keep the live feed readable - cap at the last ~50 entries, newest on top. */
+const FEED_LOG_CAP = 50;
+
+interface TelemetryState {
+  survivorsFound: number;
+  survivorsTotal: number;
+  robots: RobotTelemetry[];
+}
+
+const EMPTY_TELEMETRY: TelemetryState = { survivorsFound: 0, survivorsTotal: 0, robots: [] };
 
 export default function Home() {
   const [seed, setSeed] = useState(DEFAULT_SEED);
@@ -35,6 +52,21 @@ export default function Home() {
   const [robots, setRobots] = useState<RescueRobot[] | null>(null);
   const [selected, setSelected] = useState<MapEntity | null>(null);
   const [showRobotRadius, setShowRobotRadius] = useState(false);
+
+  // Bottom quick-filters: hide/show entity groups in the 3D scene.
+  const [showHazards, setShowHazards] = useState(true);
+  const [showRoutes, setShowRoutes] = useState(true);
+  const [showBlockedPaths, setShowBlockedPaths] = useState(true);
+
+  // Left/right HUD drawers.
+  const [fleetOpen, setFleetOpen] = useState(false);
+  const [feedOpen, setFeedOpen] = useState(false);
+
+  // Live mission telemetry, pushed up (throttled to ~4Hz) from DisasterMap3D.
+  const [telemetry, setTelemetry] = useState<TelemetryState>(EMPTY_TELEMETRY);
+  const [feedLog, setFeedLog] = useState<FeedEntry[]>([]);
+
+  const comms = useCommsStability(seed);
 
   const handleGenerated = useCallback((generated: GeneratedDisasterMap) => {
     setMap(generated);
@@ -48,9 +80,27 @@ export default function Home() {
     setSelected(entity);
   }, []);
 
+  const handleTelemetryUpdate = useCallback((snapshot: TelemetrySnapshot) => {
+    setTelemetry({
+      survivorsFound: snapshot.survivorsFound,
+      survivorsTotal: snapshot.survivorsTotal,
+      robots: snapshot.robots,
+    });
+    if (snapshot.newFeedEntries.length > 0) {
+      setFeedLog((prev) =>
+        [...snapshot.newFeedEntries].reverse().concat(prev).slice(0, FEED_LOG_CAP)
+      );
+    }
+  }, []);
+
   const handleApplySeed = useCallback((nextSeed: string) => {
     setSelected(null);
     setSeed(nextSeed);
+    // Live telemetry is runtime state, not part of the deterministic seed
+    // payload - reset it explicitly so the new session starts clean instead
+    // of showing the previous seed's stale found-count/feed log.
+    setTelemetry(EMPTY_TELEMETRY);
+    setFeedLog([]);
   }, []);
 
   const handleToggleRobotRadius = useCallback(() => {
@@ -65,91 +115,100 @@ export default function Home() {
         onRobotsGenerated={handleRobotsGenerated}
         onEntityClick={handleEntityClick}
         showExplorationRadius={showRobotRadius}
+        showHazards={showHazards}
+        showRoutes={showRoutes}
+        showBlockedPaths={showBlockedPaths}
+        onTelemetryUpdate={handleTelemetryUpdate}
         className="absolute inset-0"
       />
 
-      {/* Top bar */}
-      <motion.div
-        initial={{ opacity: 0, y: -16 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.5, ease: "easeOut" }}
-        className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between gap-4 border-b border-white/10 bg-gradient-to-b from-black/80 to-transparent p-4 sm:p-6"
-      >
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-md border border-cyan-400/40 bg-cyan-400/10">
-            <Radio className="h-4 w-4 text-cyan-300" />
-          </div>
-          <div>
-            <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-cyan-300/80">
-              Rescue Ops &middot; Live Site Map
-            </p>
-            <h1 className="font-mono text-sm font-semibold tracking-wide text-zinc-50 sm:text-base">
-              SEED {map?.seed ?? seed} &nbsp;/&nbsp; SECTOR-04
-            </h1>
-          </div>
-        </div>
-
-        <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-1.5 font-mono text-xs text-emerald-300 sm:flex">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-          LIVE FEED
-        </div>
-      </motion.div>
+      {/* Top bar: seed identity + mission clock + survivor found/pending + comms + drawer toggles.
+          Keyed by seed so its internal mission clock remounts (resets to T+00:00:00)
+          whenever a new map is generated - see useMissionClock's doc comment. */}
+      <TopHudBar
+        key={seed}
+        seedLabel={map?.seed ?? seed}
+        survivorsFound={telemetry.survivorsFound}
+        survivorsTotal={telemetry.survivorsTotal || map?.survivors.length || 0}
+        comms={comms}
+        fleetOpen={fleetOpen}
+        onToggleFleet={() => setFleetOpen((prev) => !prev)}
+        feedOpen={feedOpen}
+        onToggleFeed={() => setFeedOpen((prev) => !prev)}
+      />
 
       {/* Seed controls: regenerate randomly or type your own */}
       <div className="absolute left-4 top-24 sm:left-6 sm:top-28">
         <SeedControlPanel currentSeed={map?.seed ?? seed} onApplySeed={handleApplySeed} />
       </div>
 
-      {/* Stats HUD */}
+      {/* Left drawer: Robot Fleet Status */}
+      <RobotFleetDrawer open={fleetOpen} onClose={() => setFleetOpen(false)} robots={telemetry.robots} />
+
+      {/* Right drawer: Live Hazard & Survivor Feed */}
+      <HazardFeedDrawer open={feedOpen} onClose={() => setFeedOpen(false)} entries={feedLog} />
+
+      {/* Bottom chrome: quick filters + stats HUD */}
       <motion.div
         initial={{ opacity: 0, y: 16 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, delay: 0.1, ease: "easeOut" }}
-        className="pointer-events-none absolute bottom-0 left-0 flex flex-wrap gap-3 p-4 sm:p-6"
+        className="pointer-events-none absolute bottom-0 left-0 flex w-full flex-col gap-2.5 p-4 sm:p-6"
       >
-        <HudStat
-          icon={<HeartPulse className="h-4 w-4" />}
-          label="Survivors"
-          value={map?.survivors.length ?? "-"}
-          tone="emerald"
+        <FilterTogglesBar
+          showHazards={showHazards}
+          onToggleHazards={() => setShowHazards((prev) => !prev)}
+          showRoutes={showRoutes}
+          onToggleRoutes={() => setShowRoutes((prev) => !prev)}
+          showBlockedPaths={showBlockedPaths}
+          onToggleBlockedPaths={() => setShowBlockedPaths((prev) => !prev)}
         />
-        <HudStat
-          icon={<AlertTriangle className="h-4 w-4" />}
-          label="Hazards"
-          value={map?.hazards.length ?? "-"}
-          tone="amber"
-        />
-        <HudStat
-          icon={<Blocks className="h-4 w-4" />}
-          label="Blocked Paths"
-          value={map?.blockedPaths.length ?? "-"}
-          tone="rose"
-        />
-        <HudStat
-          icon={<RouteIcon className="h-4 w-4" />}
-          label="Clear Corridors"
-          value={map?.corridors.length ?? "-"}
-          tone="cyan"
-        />
-        <HudStat
-          icon={<Activity className="h-4 w-4" />}
-          label="Rubble Blocks"
-          value={map?.rubble.length ?? "-"}
-          tone="zinc"
-        />
-        <HudStat
-          icon={<Leaf className="h-4 w-4" />}
-          label="Terrain"
-          value={map ? capitalize(map.biomes.dominant) : "-"}
-          tone="emerald"
-        />
-        <HudStat
-          icon={<Bot className="h-4 w-4" />}
-          label="Rescue Robots"
-          value={robots?.length ?? "-"}
-          tone="sky"
-        />
-        <RobotRadiusToggle active={showRobotRadius} onToggle={handleToggleRobotRadius} />
+
+        <div className="flex flex-wrap gap-3">
+          <HudStat
+            icon={<HeartPulse className="h-4 w-4" />}
+            label="Survivors"
+            value={map?.survivors.length ?? "-"}
+            tone="emerald"
+          />
+          <HudStat
+            icon={<AlertTriangle className="h-4 w-4" />}
+            label="Hazards"
+            value={map?.hazards.length ?? "-"}
+            tone="amber"
+          />
+          <HudStat
+            icon={<Blocks className="h-4 w-4" />}
+            label="Blocked Paths"
+            value={map?.blockedPaths.length ?? "-"}
+            tone="rose"
+          />
+          <HudStat
+            icon={<RouteIcon className="h-4 w-4" />}
+            label="Clear Corridors"
+            value={map?.corridors.length ?? "-"}
+            tone="cyan"
+          />
+          <HudStat
+            icon={<Activity className="h-4 w-4" />}
+            label="Rubble Blocks"
+            value={map?.rubble.length ?? "-"}
+            tone="zinc"
+          />
+          <HudStat
+            icon={<Leaf className="h-4 w-4" />}
+            label="Terrain"
+            value={map ? capitalize(map.biomes.dominant) : "-"}
+            tone="emerald"
+          />
+          <HudStat
+            icon={<Bot className="h-4 w-4" />}
+            label="Rescue Robots"
+            value={robots?.length ?? "-"}
+            tone="sky"
+          />
+          <RobotRadiusToggle active={showRobotRadius} onToggle={handleToggleRobotRadius} />
+        </div>
       </motion.div>
 
       {/* Selected entity inspector */}

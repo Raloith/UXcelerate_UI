@@ -12,6 +12,14 @@ const ROBOT_BASE: [number, number] = [0, -MAP_HALF + 14];
 /** Distinct "friendly unit" tactical colors, cyan-forward, easy to tell apart from hazards/survivors. */
 const ROBOT_COLORS = ["#38f2ff", "#f2f7ff", "#7af0c2", "#ffd873"] as const;
 
+/** Small deterministic set of mission-relevant payloads, one assigned per robot. */
+const PAYLOAD_TYPES = [
+  "Thermal Imager",
+  "Medkit Drop",
+  "Debris Claw",
+  "Comms Relay",
+] as const;
+
 export interface RescueRobot {
   id: string;
   color: string;
@@ -24,6 +32,14 @@ export interface RescueRobot {
   /** Total loop length in meters, precomputed once for frame-time interpolation. */
   pathLength: number;
   basePosition: [number, number];
+  /** Seeded mission-equipment label shown in the Robot Fleet Status HUD drawer. */
+  payload: string;
+  /** Seeded starting battery charge (%), before runtime drain is applied. */
+  batteryStart: number;
+  /** Deterministic battery drain rate (% per minute of session elapsed time). */
+  drainRatePercentPerMin: number;
+  /** Seeded phase offset for this robot's simulated RSSI wobble. */
+  rssiPhase: number;
 }
 
 /**
@@ -74,6 +90,10 @@ export function generateRobots(seed: string, map: GeneratedDisasterMap): RescueR
       waypoints,
       pathLength,
       basePosition,
+      payload: rng.pick(PAYLOAD_TYPES),
+      batteryStart: rng.range(72, 100),
+      drainRatePercentPerMin: rng.range(0.4, 1.3),
+      rssiPhase: rng.next() * Math.PI * 2,
     });
   }
   return robots;

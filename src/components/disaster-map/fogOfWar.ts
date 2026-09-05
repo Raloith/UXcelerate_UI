@@ -33,6 +33,26 @@ export function fogCellCenter(i: number, j: number): [number, number] {
 }
 
 /**
+ * Reverse of `fogCellCenter`: which row-major cell index a world-space
+ * (x, z) point falls into (clamped to the grid bounds). Used to build a
+ * one-time reverse lookup from "fog cell" to "entities sitting in it", so
+ * the HUD's reveal-event scan (see telemetry.ts) can check newly-revealed
+ * cells against hazard/survivor positions in O(1) instead of re-scanning
+ * every entity every frame.
+ */
+export function cellIndexForPosition(x: number, z: number): number {
+  const i = Math.min(
+    FOG_RESOLUTION - 1,
+    Math.max(0, Math.floor((x + MAP_HALF) / FOG_CELL_SIZE))
+  );
+  const j = Math.min(
+    FOG_RESOLUTION - 1,
+    Math.max(0, Math.floor((z + MAP_HALF) / FOG_CELL_SIZE))
+  );
+  return j * FOG_RESOLUTION + i;
+}
+
+/**
  * Build the initial fog-of-war grid for a seed. Roughly 80% of the map
  * starts hidden; the rest is a deterministic, organic-edged cluster around
  * each given base coordinate (robots "already know" their home turf).
