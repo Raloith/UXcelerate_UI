@@ -17,6 +17,14 @@ import {
   type MapEntity,
 } from "./generateDisasterMap";
 import { hashStringToSeed } from "./rng";
+import {
+  FOG_CELL_SIZE,
+  createFogOfWar,
+  revealFogAround,
+  fogCellCenter,
+  type FogOfWarState,
+} from "./fogOfWar";
+import { generateRobots, sampleRobotPosition, type RescueRobot } from "./robots";
 
 /** Deterministic 0..1 float derived from a string id (no Math.random). */
 function phaseFromId(id: string): number {
@@ -35,6 +43,7 @@ export {
   type BiomeType,
   type BiomeSample,
 } from "./generateDisasterMap";
+export type { RescueRobot } from "./robots";
 
 // ---------------------------------------------------------------------------
 // Palette - colorful biomes, still dark & technical at the edges/hazards
@@ -52,6 +61,9 @@ const PALETTE = {
   fog: "#241f16",
   sun: "#fff2c9",
   sunHalo: "#ffcf6b",
+  fogOfWar: "#070a10",
+  fogOfWarStatic: "#3d5568",
+  robotRing: "#38f2ff",
 } as const;
 
 /** Base ground color per biome (low elevation / shaded). */
@@ -369,6 +381,183 @@ function SurvivorMarker({ entity }: { entity: MapEntity }) {
 }
 
 // ---------------------------------------------------------------------------
+// Fog of war - dark "unmapped sector" overlay tiles, permanently dissolving
+// as rescue robots' sensor radii pass over them. Rendered as one
+// InstancedMesh of thin boxes (one per fog cell, gapped slightly so the
+// negative space reads as a grid, same "plain geometry, no custom GLSL"
+// idiom as Terrain's vertex-colored mesh above) rather than a shader plane.
+// Each tile's scale tracks `1 - explored` every frame, so clearing looks
+// like a smooth shrink/dissolve rather than an instant pop, and a per-cell
+// deterministic color flicker on still-hidden tiles reads as sensor static.
+// ---------------------------------------------------------------------------
+
+const FOG_TILE_FOOTPRINT_RATIO = 0.92; // leaves ~8% gaps between tiles as grid lines
+const FOG_TILE_MAX_HEIGHT = 0.55;
+const FOG_HEIGHT_OFFSET = 0.5; // sits just above the terrain surface
+const FOG_STATIC_FLICKER = 0.55;
+
+function FogOfWar({ map, fog }: { map: GeneratedDisasterMap; fog: FogOfWarState }) {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const tmpColor = useMemo(() => new THREE.Color(), []);
+  const baseColor = useMemo(() => new THREE.Color(PALETTE.fogOfWar), []);
+  const staticColor = useMemo(() => new THREE.Color(PALETTE.fogOfWarStatic), []);
+  const cellCount = fog.resolution * fog.resolution;
+
+  // Cell centers + ground elevation are static for a given map, so they're
+  // precomputed once instead of re-sampling terrain noise every frame.
+  const cells = useMemo(() => {
+    const centers: Array<[number, number, number]> = [];
+    for (let j = 0; j < fog.resolution; j++) {
+      for (let i = 0; i < fog.resolution; i++) {
+        const [x, z] = fogCellCenter(i, j);
+        centers.push([x, map.getElevation(x, z) + FOG_HEIGHT_OFFSET, z]);
+      }
+    }
+    return centers;
+  }, [map, fog.resolution]);
+
+  useFrame(({ clock }) => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const { explored, phases } = fog;
+    const footprint = FOG_CELL_SIZE * FOG_TILE_FOOTPRINT_RATIO;
+    const t = clock.getElapsedTime();
+
+    for (let idx = 0; idx < cellCount; idx++) {
+      const hidden = 1 - explored[idx];
+      const [x, y, z] = cells[idx];
+
+      dummy.position.set(x, y, z);
+      dummy.scale.set(footprint * hidden, FOG_TILE_MAX_HEIGHT * hidden, footprint * hidden);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(idx, dummy.matrix);
+
+      const flicker = hidden > 0.02 ? Math.max(0, Math.sin(t * 4.5 + phases[idx])) * FOG_STATIC_FLICKER * hidden : 0;
+      tmpColor.copy(baseColor).lerp(staticColor, flicker);
+      mesh.setColorAt(idx, tmpColor);
+    }
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  });
+
+  return (
+    <instancedMesh
+      ref={meshRef}
+      args={[undefined, undefined, cellCount]}
+      frustumCulled={false}
+      renderOrder={5}
+    >
+      <boxGeometry args={[1, 1, 1]} />
+      <meshBasicMaterial
+        vertexColors
+        transparent
+        opacity={0.92}
+        depthWrite={false}
+        toneMapped={false}
+      />
+    </instancedMesh>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rescue robots - small deterministic patrol units whose sensor radius
+// permanently clears the fog-of-war grid as they roam. Path is precomputed
+// once from the seed (generateRobots), then walked every frame via distance
+// += delta * speed - no per-frame randomness, matching the project's "no
+// Math.random in render/useFrame" convention.
+// ---------------------------------------------------------------------------
+
+const ROBOT_BOB_AMPLITUDE = 0.07;
+
+function RobotUnit({
+  robot,
+  map,
+  fog,
+  showRadius,
+}: {
+  robot: RescueRobot;
+  map: GeneratedDisasterMap;
+  fog: FogOfWarState;
+  showRadius: boolean;
+}) {
+  const groupRef = useRef<THREE.Group>(null);
+  const bodyRef = useRef<THREE.Mesh>(null);
+  const distanceRef = useRef(0);
+  const phase = useMemo(() => phaseFromId(robot.id) * Math.PI * 2, [robot.id]);
+  const color = useMemo(() => new THREE.Color(robot.color), [robot.color]);
+
+  useFrame(({ clock }, delta) => {
+    distanceRef.current += delta * robot.speed;
+    const [x, z] = sampleRobotPosition(robot, distanceRef.current);
+    const groundY = map.getElevation(x, z);
+
+    // Keep clearing fog every frame regardless of whether the radius ring
+    // is currently shown - the toggle only affects the visual, not the sim.
+    revealFogAround(fog, x, z, robot.radius, delta);
+
+    if (groupRef.current) groupRef.current.position.set(x, groundY, z);
+    if (bodyRef.current) {
+      bodyRef.current.position.y = 0.48 + Math.sin(clock.getElapsedTime() * 3 + phase) * ROBOT_BOB_AMPLITUDE;
+    }
+  });
+
+  return (
+    <group ref={groupRef} userData={{ entityType: "robot", entityId: robot.id }}>
+      <mesh ref={bodyRef} castShadow>
+        <boxGeometry args={[0.6, 0.4, 0.85]} />
+        <meshStandardMaterial
+          color={color}
+          emissive={color}
+          emissiveIntensity={0.85}
+          roughness={0.35}
+          metalness={0.5}
+        />
+      </mesh>
+      <mesh position={[0, 0.82, 0]}>
+        <coneGeometry args={[0.22, 0.3, 4]} />
+        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={1.5} roughness={0.3} />
+      </mesh>
+      <pointLight color={robot.color} intensity={1.8} distance={6} decay={2} />
+
+      {showRadius && (
+        <group position={[0, 0.06, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <mesh>
+            <circleGeometry args={[robot.radius, 48]} />
+            <meshBasicMaterial color={color} transparent opacity={0.06} depthWrite={false} side={THREE.DoubleSide} />
+          </mesh>
+          <mesh>
+            <ringGeometry args={[robot.radius * 0.95, robot.radius, 64]} />
+            <meshBasicMaterial color={color} transparent opacity={0.55} depthWrite={false} side={THREE.DoubleSide} />
+          </mesh>
+        </group>
+      )}
+    </group>
+  );
+}
+
+function RescueRobots({
+  robots,
+  map,
+  fog,
+  showRadius,
+}: {
+  robots: RescueRobot[];
+  map: GeneratedDisasterMap;
+  fog: FogOfWarState;
+  showRadius: boolean;
+}) {
+  return (
+    <>
+      {robots.map((robot) => (
+        <RobotUnit key={robot.id} robot={robot} map={map} fog={fog} showRadius={showRadius} />
+      ))}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sun - a simple glowing sphere "just for show", plus the light it casts
 // ---------------------------------------------------------------------------
 
@@ -459,9 +648,15 @@ function TacticalOrbitControls() {
 
 function Scene({
   map,
+  robots,
+  fog,
+  showExplorationRadius,
   onEntityClick,
 }: {
   map: GeneratedDisasterMap;
+  robots: RescueRobot[];
+  fog: FogOfWarState;
+  showExplorationRadius: boolean;
   onEntityClick?: (entity: MapEntity) => void;
 }) {
   const handleClick = (entity: MapEntity) => (event: ThreeEvent<MouseEvent>) => {
@@ -522,6 +717,9 @@ function Scene({
         </group>
       ))}
 
+      <RescueRobots robots={robots} map={map} fog={fog} showRadius={showExplorationRadius} />
+      <FogOfWar map={map} fog={fog} />
+
       <TacticalOrbitControls />
     </>
   );
@@ -538,6 +736,14 @@ export interface DisasterMap3DProps {
   onGenerated?: (map: GeneratedDisasterMap) => void;
   /** Fired when a rubble/hazard/survivor entity mesh is clicked. */
   onEntityClick?: (entity: MapEntity) => void;
+  /**
+   * Show/hide the translucent sensor-radius ring under each rescue robot.
+   * Purely visual - the robots keep patrolling and clearing fog-of-war
+   * either way, this only toggles whether the ring itself is drawn.
+   */
+  showExplorationRadius?: boolean;
+  /** Fired once per generation with the deterministic rescue-robot roster (positions/paths/radius all derive from the same seed). */
+  onRobotsGenerated?: (robots: RescueRobot[]) => void;
   className?: string;
 }
 
@@ -545,14 +751,29 @@ export default function DisasterMap3D({
   seed = DEFAULT_SEED,
   onGenerated,
   onEntityClick,
+  showExplorationRadius = false,
+  onRobotsGenerated,
   className,
 }: DisasterMap3DProps) {
   const map = useMemo(() => generateDisasterMap(seed), [seed]);
+  const robots = useMemo(() => generateRobots(seed, map), [seed, map]);
+  // Robots' home base(s) seed the initial ~20%-explored cluster, so the fog
+  // pattern and robot roster always agree and both stay fully deterministic
+  // per-seed.
+  const fog = useMemo(
+    () => createFogOfWar(seed, robots.map((r) => r.basePosition)),
+    [seed, robots]
+  );
 
   useEffect(() => {
     onGenerated?.(map);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map]);
+
+  useEffect(() => {
+    onRobotsGenerated?.(robots);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [robots]);
 
   return (
     <div className={className} style={{ width: "100%", height: "100%" }}>
@@ -562,7 +783,13 @@ export default function DisasterMap3D({
         camera={{ position: [70, 95, 70], fov: 42, near: 0.1, far: 800 }}
         gl={{ antialias: true }}
       >
-        <Scene map={map} onEntityClick={onEntityClick} />
+        <Scene
+          map={map}
+          robots={robots}
+          fog={fog}
+          showExplorationRadius={showExplorationRadius}
+          onEntityClick={onEntityClick}
+        />
       </Canvas>
     </div>
   );
