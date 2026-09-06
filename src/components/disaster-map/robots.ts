@@ -20,6 +20,10 @@ const PAYLOAD_TYPES = [
   "Comms Relay",
 ] as const;
 
+/** Simulated UHF telemetry band the fleet's per-robot coordination channels are drawn from - purely cosmetic flavor text. */
+const CHANNEL_FREQUENCY_MIN_MHZ = 410;
+const CHANNEL_FREQUENCY_MAX_MHZ = 470;
+
 export interface RescueRobot {
   id: string;
   color: string;
@@ -40,6 +44,10 @@ export interface RescueRobot {
   drainRatePercentPerMin: number;
   /** Seeded phase offset for this robot's simulated RSSI wobble. */
   rssiPhase: number;
+  /** Seeded coordination-channel label shown in the Robot Fleet Status HUD (e.g. "CH-2"). */
+  channelLabel: string;
+  /** Seeded simulated comms frequency (MHz) for that same channel, purely cosmetic flavor text. */
+  channelFrequencyMHz: number;
 }
 
 /**
@@ -85,8 +93,12 @@ export function generateRobots(seed: string, map: GeneratedDisasterMap): RescueR
     robots.push({
       id: `robot-${n}`,
       color: ROBOT_COLORS[n % ROBOT_COLORS.length],
-      radius: rng.range(15, 25),
-      speed: rng.range(3.2, 5.2),
+      // Roughly 35% smaller than the original 15-25m sensor sweep, so a
+      // full-map exploration takes meaningfully longer (see fogOfWar.ts).
+      radius: rng.range(10, 16),
+      // Roughly half the original 3.2-5.2 m/s patrol pace - still visibly
+      // on the move, just a calmer sweep of the site.
+      speed: rng.range(1.6, 2.6),
       waypoints,
       pathLength,
       basePosition,
@@ -94,6 +106,9 @@ export function generateRobots(seed: string, map: GeneratedDisasterMap): RescueR
       batteryStart: rng.range(72, 100),
       drainRatePercentPerMin: rng.range(0.4, 1.3),
       rssiPhase: rng.next() * Math.PI * 2,
+      channelLabel: `CH-${n + 1}`,
+      channelFrequencyMHz:
+        Math.round(rng.range(CHANNEL_FREQUENCY_MIN_MHZ, CHANNEL_FREQUENCY_MAX_MHZ) * 100) / 100,
     });
   }
   return robots;

@@ -17,6 +17,15 @@ import type { RescueRobot } from "./robots";
 /** Live [x, z] position for a robot, keyed by robot id. Written every frame by RobotUnit, read (throttled) by TelemetryTracker. */
 export type RobotPositions = Record<string, { x: number; z: number }>;
 
+/**
+ * Which robot is escorting a given "found" survivor, keyed by survivor id.
+ * Written once (imperatively, never React state) by TelemetryTracker at the
+ * moment a survivor's fog cell first crosses the reveal threshold, then read
+ * every frame by SurvivorMarker to drive its post-rescue trailing position.
+ * Absence of a key means that survivor hasn't been found yet.
+ */
+export type SurvivorEscortMap = Record<string, string>;
+
 export type RobotTask =
   | "Patrolling Sector"
   | "Approaching Survivor"
@@ -32,6 +41,10 @@ export interface RobotTelemetry {
   batteryPercent: number;
   rssiDbm: number;
   task: RobotTask;
+  /** Seeded coordination-channel label (e.g. "CH-2"), see robots.ts. */
+  channelLabel: string;
+  /** Seeded simulated comms frequency (MHz) for that channel. */
+  channelFrequencyMHz: number;
 }
 
 export type FeedKind = "hazard" | "blocked-path" | "survivor";
@@ -42,6 +55,8 @@ export interface FeedEntry {
   /** Seconds elapsed since the current seed's session started. */
   timestampSeconds: number;
   robotLabel: string;
+  /** Coordination-channel label the reporting robot broadcast this finding on, see robots.ts. */
+  channelLabel: string;
   kind: FeedKind;
   title: string;
   detail: string;
@@ -140,6 +155,8 @@ export function computeRobotTelemetry(
     batteryPercent,
     rssiDbm,
     task: deriveRobotTask(map, x, z, distanceFromBase),
+    channelLabel: robot.channelLabel,
+    channelFrequencyMHz: robot.channelFrequencyMHz,
   };
 }
 
@@ -147,6 +164,7 @@ export function computeRobotTelemetry(
 export function makeFeedEntry(
   entity: MapEntity,
   nearestRobotId: string,
+  channelLabel: string,
   elapsedSeconds: number,
   seq: number
 ): FeedEntry {
@@ -159,6 +177,7 @@ export function makeFeedEntry(
     id: `feed-${seq}-${entity.id}`,
     timestampSeconds: elapsedSeconds,
     robotLabel,
+    channelLabel,
     position,
   };
 

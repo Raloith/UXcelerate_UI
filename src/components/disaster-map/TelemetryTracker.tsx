@@ -4,7 +4,10 @@
  * Invisible R3F component (returns null - it never renders a mesh) that
  * turns the fog-of-war grid + live robot positions into the HUD's "mission
  * telemetry": survivor found/pending count, per-robot battery/signal/task
- * rows, and the scrolling hazard/survivor feed log.
+ * rows, and the scrolling hazard/survivor feed log. Also assigns each
+ * newly-found survivor a permanent "escort" robot (nearest one at the
+ * moment of discovery), written into `escortRef` for SurvivorMarker to
+ * read every frame.
  *
  * Perf note: the reveal-event scan below runs every frame (cheap - it's a
  * flat 1600-cell array read), but it only ever *writes* to refs. Pushing
@@ -26,6 +29,7 @@ import {
   REVEAL_LOG_THRESHOLD,
   type FeedEntry,
   type RobotPositions,
+  type SurvivorEscortMap,
   type TelemetrySnapshot,
 } from "./telemetry";
 
@@ -40,6 +44,13 @@ export interface TelemetryTrackerProps {
   cellEntities: Map<number, MapEntity[]>;
   /** Wall-clock `Date.now()` this seed's session started, reset by the caller whenever `seed` changes. */
   sessionStartRef: MutableRefObject<number>;
+  /**
+   * Which robot is escorting each "found" survivor, written here (once, the
+   * moment a survivor's fog cell first crosses the reveal threshold) and
+   * read every frame by SurvivorMarker to drive its trailing position. A
+   * plain ref, never React state - see robots.ts/SurvivorEscortMap's docs.
+   */
+  escortRef: MutableRefObject<SurvivorEscortMap>;
   onTelemetryUpdate?: (snapshot: TelemetrySnapshot) => void;
 }
 
@@ -50,6 +61,7 @@ export default function TelemetryTracker({
   positionsRef,
   cellEntities,
   sessionStartRef,
+  escortRef,
   onTelemetryUpdate,
 }: TelemetryTrackerProps) {
   const fogIdentityRef = useRef<FogOfWarState | null>(null);
@@ -71,6 +83,7 @@ export default function TelemetryTracker({
       loggedCellsRef.current = new Uint8Array(fog.resolution * fog.resolution);
       foundSurvivorIdsRef.current = new Set();
       pendingFeedRef.current = [];
+      escortRef.current = {};
     }
 
     if (!onTelemetryUpdate) return;
@@ -90,11 +103,7 @@ export default function TelemetryTracker({
       if (!entitiesHere || entitiesHere.length === 0) continue;
 
       for (const entity of entitiesHere) {
-        if (entity.type === "survivor") {
-          foundSurvivorIdsRef.current.add(entity.id);
-        }
-
-        let nearestId = robots[0]?.id ?? "robot-0";
+        let nearestRobot = robots[0];
         let bestDist = Infinity;
         for (const r of robots) {
           const p = positionsRef.current[r.id];
@@ -102,12 +111,22 @@ export default function TelemetryTracker({
           const d = Math.hypot(p.x - entity.position[0], p.z - entity.position[2]);
           if (d < bestDist) {
             bestDist = d;
-            nearestId = r.id;
+            nearestRobot = r;
           }
+        }
+        const nearestId = nearestRobot?.id ?? "robot-0";
+        const channelLabel = nearestRobot?.channelLabel ?? "CH-1";
+
+        if (entity.type === "survivor") {
+          foundSurvivorIdsRef.current.add(entity.id);
+          // Stick with whichever robot was nearest at the moment of
+          // discovery as the permanent "escort" - no dynamic re-assignment,
+          // per the spec (keeps SurvivorMarker's trailing behavior simple).
+          escortRef.current[entity.id] = nearestId;
         }
 
         pendingFeedRef.current.push(
-          makeFeedEntry(entity, nearestId, elapsedSeconds, feedSeqRef.current++)
+          makeFeedEntry(entity, nearestId, channelLabel, elapsedSeconds, feedSeqRef.current++)
         );
       }
     }

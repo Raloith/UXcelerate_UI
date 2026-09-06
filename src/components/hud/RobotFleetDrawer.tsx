@@ -9,7 +9,7 @@
  */
 
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { BatteryLow, BatteryMedium, BatteryFull, X } from "lucide-react";
+import { BatteryLow, BatteryMedium, BatteryFull, Radio, X } from "lucide-react";
 import type { RobotTelemetry } from "@/components/disaster-map/telemetry";
 
 export interface RobotFleetDrawerProps {
@@ -104,6 +104,11 @@ export default function RobotFleetDrawer({ open, onClose, robots }: RobotFleetDr
                   <p className="mb-1 font-mono text-[11px] text-zinc-400">
                     <span className="text-zinc-500">SIGNAL&nbsp;</span>
                     {robot.rssiDbm} dBm
+                  </p>
+                  <p className="mb-1 flex items-center gap-1 font-mono text-[11px] text-violet-300/90">
+                    <Radio className="h-3 w-3" aria-hidden="true" />
+                    <span className="text-zinc-500">Channel:&nbsp;</span>
+                    {robot.channelLabel} &middot; {robot.channelFrequencyMHz.toFixed(2)} MHz
                   </p>
                   <p className="text-[11px] text-zinc-300">
                     <span className="font-mono text-[10px] uppercase tracking-widest text-zinc-500">

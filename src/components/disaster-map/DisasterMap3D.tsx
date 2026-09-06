@@ -5,7 +5,7 @@ import type { MutableRefObject } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { Line, OrbitControls } from "@react-three/drei";
-import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
+import type { Line2, OrbitControls as OrbitControlsImpl } from "three-stdlib";
 
 import {
   BIOME_TYPES,
@@ -28,12 +28,20 @@ import {
 } from "./fogOfWar";
 import { generateRobots, sampleRobotPosition, type RescueRobot } from "./robots";
 import TelemetryTracker from "./TelemetryTracker";
-import type { RobotPositions, TelemetrySnapshot } from "./telemetry";
+import type { RobotPositions, SurvivorEscortMap, TelemetrySnapshot } from "./telemetry";
 
 /** Deterministic 0..1 float derived from a string id (no Math.random). */
 function phaseFromId(id: string): number {
   return (hashStringToSeed(id) % 1000) / 1000;
 }
+
+/**
+ * Live 3D object refs for each robot, keyed by robot id - registered once
+ * (in an effect, not per-frame) by RobotUnit, then read every frame by
+ * CommsLinks/SurvivorMarker to draw comms links / drive escort trailing
+ * off the robot's actual rendered position without touching React state.
+ */
+type RobotObjectRefs = Record<string, THREE.Object3D | null>;
 
 export {
   generateDisasterMap,
@@ -66,6 +74,8 @@ const PALETTE = {
   rubbleB: "#847a64",
   rubbleBlocked: "#8a6146",
   route: "#38f2ff",
+  /** Tactical comms-link tint - violet/magenta, distinct from route-cyan and hazard-orange. */
+  commsLink: "#b58bff",
   survivor: "#3dffb0",
   survivorCritical: "#ff5a4d",
   hazardEmber: "#ff7a1a",
@@ -348,17 +358,42 @@ function RouteLines({ map }: { map: GeneratedDisasterMap }) {
 }
 
 // ---------------------------------------------------------------------------
-// Survivors - pulsing beacon markers pinned at ground level
+// Survivors - pulsing beacon markers pinned at ground level. Once "found"
+// (fog cell revealed - see TelemetryTracker's escortRef assignment), the
+// marker smoothly trails a couple meters off its escorting robot's live
+// position instead of staying pinned at its original spawn coordinate, as
+// if the robot is walking it out. Escort lookup + position blending is all
+// plain ref reads/writes inside useFrame - no React state, no re-renders.
 // ---------------------------------------------------------------------------
 
-function SurvivorMarker({ entity }: { entity: MapEntity }) {
+/** How far (in meters) a rescued survivor trails beside/behind its escort robot. */
+const ESCORT_OFFSET_DISTANCE = 2.1;
+/** Exponential-ease rate for the trailing lerp - same framerate-independent style as revealFogAround. */
+const ESCORT_LERP_RATE = 2.4;
+
+function SurvivorMarker({
+  entity,
+  escortRef,
+  robotObjectsRef,
+}: {
+  entity: MapEntity;
+  escortRef: MutableRefObject<SurvivorEscortMap>;
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+}) {
+  const groupRef = useRef<THREE.Group>(null);
   const ringRef = useRef<THREE.Mesh>(null);
   const coreRef = useRef<THREE.Mesh>(null);
   const phase = entity.metadata.phase as number;
   const critical = entity.metadata.status === "critical";
   const color = critical ? PALETTE.survivorCritical : PALETTE.survivor;
+  // Fixed per-survivor angle around its escort robot, so several rescued
+  // survivors escorted by the same robot fan out instead of overlapping.
+  const escortOffset = useMemo(() => {
+    const angle = phaseFromId(entity.id) * Math.PI * 2;
+    return { dx: Math.cos(angle) * ESCORT_OFFSET_DISTANCE, dz: Math.sin(angle) * ESCORT_OFFSET_DISTANCE };
+  }, [entity.id]);
 
-  useFrame(({ clock }) => {
+  useFrame(({ clock }, delta) => {
     const t = clock.getElapsedTime() * 1.6 + phase;
     const pulse = (Math.sin(t) + 1) / 2;
     if (coreRef.current) {
@@ -371,10 +406,23 @@ function SurvivorMarker({ entity }: { entity: MapEntity }) {
       const mat = ringRef.current.material as THREE.MeshBasicMaterial;
       mat.opacity = Math.max(0, 0.8 - expand);
     }
+
+    const group = groupRef.current;
+    const escortId = escortRef.current[entity.id];
+    const escortObject = escortId ? robotObjectsRef.current[escortId] : undefined;
+    if (group && escortObject) {
+      const targetX = escortObject.position.x + escortOffset.dx;
+      const targetZ = escortObject.position.z + escortOffset.dz;
+      const targetY = escortObject.position.y;
+      const ease = 1 - Math.exp(-delta * ESCORT_LERP_RATE);
+      group.position.x += (targetX - group.position.x) * ease;
+      group.position.y += (targetY - group.position.y) * ease;
+      group.position.z += (targetZ - group.position.z) * ease;
+    }
   });
 
   return (
-    <group position={entity.position}>
+    <group ref={groupRef} position={entity.position}>
       <mesh ref={coreRef} position={[0, 0.35, 0]} castShadow>
         <sphereGeometry args={[0.35, 16, 16]} />
         <meshStandardMaterial color={color} emissive={color} emissiveIntensity={1.6} />
@@ -489,18 +537,35 @@ function RobotUnit({
   fog,
   showRadius,
   positionsRef,
+  robotObjectsRef,
 }: {
   robot: RescueRobot;
   map: GeneratedDisasterMap;
   fog: FogOfWarState;
   showRadius: boolean;
   positionsRef: MutableRefObject<RobotPositions>;
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const bodyRef = useRef<THREE.Mesh>(null);
   const distanceRef = useRef(0);
   const phase = useMemo(() => phaseFromId(robot.id) * Math.PI * 2, [robot.id]);
   const color = useMemo(() => new THREE.Color(robot.color), [robot.color]);
+
+  // Publish this robot's live THREE.Group once mounted (not per-frame) so
+  // CommsLinks / SurvivorMarker elsewhere in the tree can read its actual
+  // rendered position every frame via a plain ref, matching the position-ref
+  // pattern already used for the HUD telemetry pass below.
+  useEffect(() => {
+    const node = groupRef.current;
+    const objects = robotObjectsRef.current;
+    objects[robot.id] = node;
+    return () => {
+      if (objects[robot.id] === node) {
+        delete objects[robot.id];
+      }
+    };
+  }, [robot.id, robotObjectsRef]);
 
   useFrame(({ clock }, delta) => {
     distanceRef.current += delta * robot.speed;
@@ -561,12 +626,14 @@ function RescueRobots({
   fog,
   showRadius,
   positionsRef,
+  robotObjectsRef,
 }: {
   robots: RescueRobot[];
   map: GeneratedDisasterMap;
   fog: FogOfWarState;
   showRadius: boolean;
   positionsRef: MutableRefObject<RobotPositions>;
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
 }) {
   return (
     <>
@@ -578,7 +645,109 @@ function RescueRobots({
           fog={fog}
           showRadius={showRadius}
           positionsRef={positionsRef}
+          robotObjectsRef={robotObjectsRef}
         />
+      ))}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Coordination comms links - subtle pulsing violet lines between every pair
+// of rescue robots, so the fleet visually reads as "coordinating" rather
+// than roaming independently. Only 3-4 robots ever exist at once, so the
+// handful of O(n^2) pairs is computed once (useMemo) and each pair's line
+// geometry is just updated imperatively every frame from the robots' live
+// THREE.Object3D refs (see RobotUnit's registration effect above) - no
+// React state, matching the project's existing frame-update conventions.
+// ---------------------------------------------------------------------------
+
+/** Distance (meters) at which a comms link reaches full strength; links stay faintly visible beyond this, never fully vanishing. */
+const COMMS_COORDINATION_RANGE = 95;
+/** Height (meters) the comms beam floats above each robot, clear of terrain/rubble. */
+const COMMS_LINK_HEIGHT = 2.4;
+/** "Marching ants" dash animation speed. */
+const COMMS_DASH_SPEED = 1.1;
+
+function CommsLink({
+  a,
+  b,
+  robotObjectsRef,
+}: {
+  a: RescueRobot;
+  b: RescueRobot;
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+}) {
+  const lineRef = useRef<Line2 | null>(null);
+  const phase = useMemo(() => phaseFromId(`${a.id}~${b.id}`) * Math.PI * 2, [a.id, b.id]);
+
+  useFrame(({ clock }, delta) => {
+    const line = lineRef.current;
+    const objA = robotObjectsRef.current[a.id];
+    const objB = robotObjectsRef.current[b.id];
+    if (!line || !objA || !objB) return;
+
+    line.geometry.setPositions([
+      objA.position.x,
+      objA.position.y + COMMS_LINK_HEIGHT,
+      objA.position.z,
+      objB.position.x,
+      objB.position.y + COMMS_LINK_HEIGHT,
+      objB.position.z,
+    ]);
+    line.computeLineDistances();
+    line.material.dashOffset -= delta * COMMS_DASH_SPEED;
+
+    const dist = Math.hypot(objA.position.x - objB.position.x, objA.position.z - objB.position.z);
+    const proximity = THREE.MathUtils.clamp(1 - dist / COMMS_COORDINATION_RANGE, 0, 1);
+    const pulse = (Math.sin(clock.getElapsedTime() * 1.8 + phase) + 1) / 2;
+    // Never fully fades out (min ~0.12) so the "fleet is coordinating" read
+    // stays legible even when two units are at opposite ends of the map;
+    // it just gets noticeably brighter/livelier the closer they roam.
+    line.material.opacity = 0.12 + proximity * 0.5 + pulse * 0.14;
+  });
+
+  return (
+    <Line
+      ref={lineRef}
+      points={[
+        [0, 0, 0],
+        [0, 0, 0.01],
+      ]}
+      color={PALETTE.commsLink}
+      lineWidth={1.4}
+      dashed
+      dashScale={2.5}
+      dashSize={2}
+      gapSize={1.4}
+      transparent
+      opacity={0.2}
+      depthWrite={false}
+    />
+  );
+}
+
+function CommsLinks({
+  robots,
+  robotObjectsRef,
+}: {
+  robots: RescueRobot[];
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+}) {
+  const pairs = useMemo(() => {
+    const list: Array<{ a: RescueRobot; b: RescueRobot; key: string }> = [];
+    for (let i = 0; i < robots.length; i++) {
+      for (let j = i + 1; j < robots.length; j++) {
+        list.push({ a: robots[i], b: robots[j], key: `${robots[i].id}~${robots[j].id}` });
+      }
+    }
+    return list;
+  }, [robots]);
+
+  return (
+    <>
+      {pairs.map(({ a, b, key }) => (
+        <CommsLink key={key} a={a} b={b} robotObjectsRef={robotObjectsRef} />
       ))}
     </>
   );
@@ -683,6 +852,8 @@ function Scene({
   showBlockedPaths,
   onEntityClick,
   positionsRef,
+  robotObjectsRef,
+  escortRef,
   cellEntities,
   sessionStartRef,
   onTelemetryUpdate,
@@ -696,6 +867,8 @@ function Scene({
   showBlockedPaths: boolean;
   onEntityClick?: (entity: MapEntity) => void;
   positionsRef: MutableRefObject<RobotPositions>;
+  robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  escortRef: MutableRefObject<SurvivorEscortMap>;
   cellEntities: Map<number, MapEntity[]>;
   sessionStartRef: MutableRefObject<number>;
   onTelemetryUpdate?: (snapshot: TelemetrySnapshot) => void;
@@ -756,7 +929,7 @@ function Scene({
         ))}
       {map.survivors.map((s) => (
         <group key={s.id} onClick={handleClick(s)}>
-          <SurvivorMarker entity={s} />
+          <SurvivorMarker entity={s} escortRef={escortRef} robotObjectsRef={robotObjectsRef} />
         </group>
       ))}
 
@@ -766,7 +939,9 @@ function Scene({
         fog={fog}
         showRadius={showExplorationRadius}
         positionsRef={positionsRef}
+        robotObjectsRef={robotObjectsRef}
       />
+      <CommsLinks robots={robots} robotObjectsRef={robotObjectsRef} />
       <FogOfWar map={map} fog={fog} />
       <TelemetryTracker
         map={map}
@@ -775,6 +950,7 @@ function Scene({
         positionsRef={positionsRef}
         cellEntities={cellEntities}
         sessionStartRef={sessionStartRef}
+        escortRef={escortRef}
         onTelemetryUpdate={onTelemetryUpdate}
       />
 
@@ -859,6 +1035,14 @@ export default function DisasterMap3D({
   // (throttled) by TelemetryTracker - a plain ref, never React state, so
   // 60fps position updates never trigger a re-render on their own.
   const positionsRef = useRef<RobotPositions>({});
+  // Live per-robot THREE.Object3D, registered once per robot (RobotUnit's
+  // mount effect) and read every frame by CommsLinks/SurvivorMarker for
+  // their own imperative position updates - see RobotObjectRefs above.
+  const robotObjectsRef = useRef<RobotObjectRefs>({});
+  // Which robot is escorting each found survivor, written once by
+  // TelemetryTracker the moment a survivor is revealed - see
+  // SurvivorEscortMap's doc comment in telemetry.ts.
+  const escortRef = useRef<SurvivorEscortMap>({});
   // Wall-clock session start for this seed, driving battery drain / feed
   // timestamps - resets whenever the seed (and therefore the whole map)
   // changes, matching the HUD's mission clock reset behavior. `Date.now()`
@@ -899,6 +1083,8 @@ export default function DisasterMap3D({
           showBlockedPaths={showBlockedPaths}
           onEntityClick={onEntityClick}
           positionsRef={positionsRef}
+          robotObjectsRef={robotObjectsRef}
+          escortRef={escortRef}
           cellEntities={cellEntities}
           sessionStartRef={sessionStartRef}
           onTelemetryUpdate={onTelemetryUpdate}

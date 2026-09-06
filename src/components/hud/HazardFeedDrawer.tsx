@@ -92,6 +92,9 @@ export default function HazardFeedDrawer({ open, onClose, entries }: HazardFeedD
                       </div>
                       <p className="font-semibold">{entry.title}</p>
                       <p className="text-zinc-300">{entry.detail}</p>
+                      <p className="text-violet-300/80">
+                        Broadcasting to fleet on {entry.channelLabel}
+                      </p>
                       <p className="text-zinc-500">
                         ({entry.position[0]}, {entry.position[1]})
                       </p>
