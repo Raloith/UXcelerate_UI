@@ -1035,6 +1035,7 @@ function Scene({
   showHazards,
   showRoutes,
   showBlockedPaths,
+  showGrid,
   onEntityClick,
   positionsRef,
   robotObjectsRef,
@@ -1051,6 +1052,7 @@ function Scene({
   showHazards: boolean;
   showRoutes: boolean;
   showBlockedPaths: boolean;
+  showGrid: boolean;
   onEntityClick?: (entity: MapEntity) => void;
   positionsRef: MutableRefObject<RobotPositions>;
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
@@ -1092,7 +1094,9 @@ function Scene({
 
       <Sun />
 
-      <gridHelper args={[MAP_SIZE, 40, "#2c3a4a", "#1a2230"]} position={[0, 0.02, 0]} />
+      {showGrid && (
+        <gridHelper args={[MAP_SIZE, 40, "#2c3a4a", "#1a2230"]} position={[0, 0.02, 0]} />
+      )}
 
       <Terrain map={map} />
       {showRoutes && <RouteLines map={map} />}
@@ -1173,6 +1177,8 @@ export interface DisasterMap3DProps {
   showRoutes?: boolean;
   /** Show/hide the deliberately-dumped rubble piles blocking corridors. Defaults to true. */
   showBlockedPaths?: boolean;
+  /** Show/hide the terrain grid-line overlay (the `gridHelper` drawn over the ground). Purely visual. Defaults to true. */
+  showGrid?: boolean;
   /**
    * Fired at a throttled ~4Hz with the latest mission telemetry (survivor
    * found/pending count, per-robot battery/signal/task, and any newly
@@ -1191,6 +1197,7 @@ export default function DisasterMap3D({
   showHazards = true,
   showRoutes = true,
   showBlockedPaths = true,
+  showGrid = true,
   onTelemetryUpdate,
   className,
 }: DisasterMap3DProps) {
@@ -1276,6 +1283,7 @@ export default function DisasterMap3D({
           showHazards={showHazards}
           showRoutes={showRoutes}
           showBlockedPaths={showBlockedPaths}
+          showGrid={showGrid}
           onEntityClick={onEntityClick}
           positionsRef={positionsRef}
           robotObjectsRef={robotObjectsRef}

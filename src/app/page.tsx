@@ -12,6 +12,7 @@ import {
   Leaf,
   Radar,
   Route as RouteIcon,
+  SlidersHorizontal,
 } from "lucide-react";
 
 import type {
@@ -70,10 +71,15 @@ export default function Home() {
   const [showHazards, setShowHazards] = useState(true);
   const [showRoutes, setShowRoutes] = useState(true);
   const [showBlockedPaths, setShowBlockedPaths] = useState(true);
+  const [showGrid, setShowGrid] = useState(true);
 
   // Left/right HUD drawers.
   const [fleetOpen, setFleetOpen] = useState(false);
   const [feedOpen, setFeedOpen] = useState(false);
+  // Top-left seed control panel - a third floating panel following the same
+  // open/closed convention as the two drawers above (default closed, an
+  // external affordance reopens it) so it stops permanently blocking the view.
+  const [seedPanelOpen, setSeedPanelOpen] = useState(false);
 
   // Live mission telemetry, pushed up (throttled to ~4Hz) from DisasterMap3D.
   const [telemetry, setTelemetry] = useState<TelemetryState>(EMPTY_TELEMETRY);
@@ -224,6 +230,7 @@ export default function Home() {
         showHazards={showHazards}
         showRoutes={showRoutes}
         showBlockedPaths={showBlockedPaths}
+        showGrid={showGrid}
         onTelemetryUpdate={handleTelemetryUpdate}
         className="absolute inset-0"
       />
@@ -243,9 +250,46 @@ export default function Home() {
         onToggleFeed={() => setFeedOpen((prev) => !prev)}
       />
 
-      {/* Seed controls: regenerate randomly or type your own */}
-      <div className="absolute left-4 top-24 sm:left-6 sm:top-28">
-        <SeedControlPanel currentSeed={map?.seed ?? seed} onApplySeed={handleApplySeed} />
+      {/* Seed controls: regenerate randomly or type your own. Collapsible so
+          it never permanently blocks the view - closed by default, matching
+          the two HUD drawers' open/closed convention, with a small floating
+          tab left behind to reopen it. */}
+      <div className="absolute left-4 top-24 z-20 sm:left-6 sm:top-28">
+        <AnimatePresence mode="wait" initial={false}>
+          {seedPanelOpen ? (
+            <motion.div
+              key="seed-panel"
+              initial={{ opacity: 0, x: -24 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -24 }}
+              transition={{ type: "spring", stiffness: 260, damping: 28 }}
+            >
+              <SeedControlPanel
+                currentSeed={map?.seed ?? seed}
+                onApplySeed={handleApplySeed}
+                onClose={() => setSeedPanelOpen(false)}
+              />
+            </motion.div>
+          ) : (
+            <motion.button
+              key="seed-tab"
+              type="button"
+              onClick={() => setSeedPanelOpen(true)}
+              initial={{ opacity: 0, x: -24 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -24 }}
+              transition={{ type: "spring", stiffness: 260, damping: 28 }}
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              aria-expanded={false}
+              aria-label="Show seed control panel"
+              className="pointer-events-auto flex items-center gap-2 rounded-full border border-white/10 bg-black/75 px-3 py-2 font-mono text-[11px] uppercase tracking-widest text-cyan-200 shadow-lg shadow-black/40 backdrop-blur-md transition-colors hover:border-cyan-400/40 hover:bg-black/85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+              Seed Control
+            </motion.button>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* Left drawer: Robot Fleet Status */}
@@ -278,6 +322,8 @@ export default function Home() {
           onToggleRoutes={() => setShowRoutes((prev) => !prev)}
           showBlockedPaths={showBlockedPaths}
           onToggleBlockedPaths={() => setShowBlockedPaths((prev) => !prev)}
+          showGrid={showGrid}
+          onToggleGrid={() => setShowGrid((prev) => !prev)}
         />
 
         <div className="flex flex-wrap gap-3">

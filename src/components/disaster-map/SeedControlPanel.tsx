@@ -23,7 +23,7 @@
 
 import { useCallback, useId, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { CircleAlert, CircleCheck, Dices } from "lucide-react";
+import { CircleAlert, CircleCheck, Dices, X } from "lucide-react";
 
 const SEED_WORDS = ["QUAKE", "SECTOR", "TREMOR", "FAULT", "RUBBLE", "SIGNAL", "GRID"];
 
@@ -39,12 +39,19 @@ export interface SeedControlPanelProps {
   currentSeed: string;
   /** Called with a new seed string whenever the user regenerates or applies one. */
   onApplySeed: (seed: string) => void;
+  /**
+   * Called when the user collapses/closes the panel via its header button.
+   * Optional so this component still works standalone; when omitted, no
+   * close button is rendered.
+   */
+  onClose?: () => void;
   className?: string;
 }
 
 export default function SeedControlPanel({
   currentSeed,
   onApplySeed,
+  onClose,
   className,
 }: SeedControlPanelProps) {
   const [draft, setDraft] = useState("");
@@ -98,12 +105,24 @@ export default function SeedControlPanel({
     >
       <div className="mb-3 flex items-center justify-between gap-2">
         <h2 className="uppercase tracking-widest text-cyan-300/80">Seed Control</h2>
-        <span
-          className="max-w-[9.5rem] truncate rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-300"
-          title={`Active seed currently driving this map: ${currentSeed}`}
-        >
-          ACTIVE: {currentSeed}
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span
+            className="max-w-[9.5rem] truncate rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-300"
+            title={`Active seed currently driving this map: ${currentSeed}`}
+          >
+            ACTIVE: {currentSeed}
+          </span>
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Collapse seed control panel"
+              className="rounded-md p-1 text-zinc-500 transition-colors hover:text-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* --- Option 1: Regenerate with a fresh random seed --- */}

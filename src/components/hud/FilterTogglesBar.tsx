@@ -9,7 +9,7 @@
 
 import { motion } from "motion/react";
 import type { ReactNode } from "react";
-import { AlertTriangle, Blocks, Route as RouteIcon } from "lucide-react";
+import { AlertTriangle, Blocks, Grid3x3, Route as RouteIcon } from "lucide-react";
 
 export interface FilterTogglesBarProps {
   showHazards: boolean;
@@ -18,6 +18,8 @@ export interface FilterTogglesBarProps {
   onToggleRoutes: () => void;
   showBlockedPaths: boolean;
   onToggleBlockedPaths: () => void;
+  showGrid: boolean;
+  onToggleGrid: () => void;
 }
 
 export default function FilterTogglesBar({
@@ -27,6 +29,8 @@ export default function FilterTogglesBar({
   onToggleRoutes,
   showBlockedPaths,
   onToggleBlockedPaths,
+  showGrid,
+  onToggleGrid,
 }: FilterTogglesBarProps) {
   return (
     <div className="pointer-events-auto flex flex-wrap gap-2">
@@ -47,6 +51,12 @@ export default function FilterTogglesBar({
         label="Show Blockades"
         active={showBlockedPaths}
         onToggle={onToggleBlockedPaths}
+      />
+      <FilterPill
+        icon={<Grid3x3 className="h-3.5 w-3.5" aria-hidden="true" />}
+        label="Show Grid"
+        active={showGrid}
+        onToggle={onToggleGrid}
       />
     </div>
   );
