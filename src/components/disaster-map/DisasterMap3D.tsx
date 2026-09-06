@@ -29,6 +29,14 @@ import {
 import { generateRobots, sampleRobotPosition, type RescueRobot } from "./robots";
 import TelemetryTracker from "./TelemetryTracker";
 import type { RobotPositions, SurvivorEscortMap, TelemetrySnapshot } from "./telemetry";
+import {
+  commsDropPhaseForRobot,
+  commsQualityAt,
+  createCommsDropTracker,
+  updateCommsDropTracker,
+  type CommsLinkState,
+  type RobotCommsStates,
+} from "./commsDrop";
 
 /** Deterministic 0..1 float derived from a string id (no Math.random). */
 function phaseFromId(id: string): number {
@@ -60,10 +68,14 @@ export type {
   FeedEntry,
   FeedKind,
   FeedSeverity,
+  QueuedCommand,
+  QueuedCommandKind,
   RobotTask,
   RobotTelemetry,
   TelemetrySnapshot,
 } from "./telemetry";
+export { CANNED_COMMANDS, makeCommandExecutedFeedEntry } from "./telemetry";
+export type { CommsLinkState } from "./commsDrop";
 
 // ---------------------------------------------------------------------------
 // Palette - colorful biomes, still dark & technical at the edges/hazards
@@ -86,7 +98,30 @@ const PALETTE = {
   fogOfWar: "#070a10",
   fogOfWarStatic: "#3d5568",
   robotRing: "#38f2ff",
+  /** Comms-link health tones - shared with the HUD's LINK: NOMINAL/DEGRADED/LOST styling (emerald/amber/rose). */
+  commsNominal: "#34d399",
+  commsDegraded: "#fbbf24",
+  commsLost: "#fb7185",
 } as const;
+
+/**
+ * Precomputed once at module scope (pure, no React/Fiber involved) - the
+ * "broken link" tint colors used to blend a robot's body material and its
+ * CommsLink beams toward amber/red as comms degrade, and the stale-trail
+ * line's color while a robot is amber/red. Kept as module-level `THREE.Color`
+ * instances (like PALETTE's own hex strings) rather than re-allocating a new
+ * Color every frame per robot.
+ */
+const COMMS_TINT_AMBER = new THREE.Color(PALETTE.commsDegraded);
+const COMMS_TINT_RED = new THREE.Color(PALETTE.commsLost);
+const COMMS_LINK_COLOR_AMBER = new THREE.Color(PALETTE.commsLink).lerp(
+  new THREE.Color(PALETTE.commsDegraded),
+  0.55
+);
+const COMMS_LINK_COLOR_RED = new THREE.Color(PALETTE.commsLink).lerp(
+  new THREE.Color(PALETTE.commsLost),
+  0.7
+);
 
 /** Base ground color per biome (low elevation / shaded). */
 const BIOME_COLOR: Record<BiomeType, string> = {
@@ -531,6 +566,15 @@ function FogOfWar({ map, fog }: { map: GeneratedDisasterMap; fog: FogOfWarState 
 
 const ROBOT_BOB_AMPLITUDE = 0.07;
 
+/** Fixed-length ring buffer of recent rendered positions per robot, rendered as a dashed stale-path trail only while amber/red - see the trail Line below. */
+const TRAIL_LENGTH = 40;
+/** Sits just above the terrain so the dashed trail never z-fights the ground mesh. */
+const TRAIL_HEIGHT_OFFSET = 0.12;
+/** Exponential-ease rate for the trail's fade in/out opacity - same framerate-independent style as revealFogAround. */
+const TRAIL_OPACITY_EASE_RATE = 3;
+/** Exponential-ease rate for the robot body material's comms-tint blend. */
+const BODY_TINT_EASE_RATE = 2.5;
+
 function RobotUnit({
   robot,
   map,
@@ -538,6 +582,7 @@ function RobotUnit({
   showRadius,
   positionsRef,
   robotObjectsRef,
+  commsStateRef,
 }: {
   robot: RescueRobot;
   map: GeneratedDisasterMap;
@@ -545,12 +590,46 @@ function RobotUnit({
   showRadius: boolean;
   positionsRef: MutableRefObject<RobotPositions>;
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  commsStateRef: MutableRefObject<RobotCommsStates>;
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const bodyRef = useRef<THREE.Mesh>(null);
+  const bodyMaterialRef = useRef<THREE.MeshStandardMaterial>(null);
+  const trailLineRef = useRef<Line2 | null>(null);
   const distanceRef = useRef(0);
   const phase = useMemo(() => phaseFromId(robot.id) * Math.PI * 2, [robot.id]);
   const color = useMemo(() => new THREE.Color(robot.color), [robot.color]);
+  const tintScratch = useMemo(() => new THREE.Color(), []);
+
+  // Comms-drop simulation state - a smooth per-robot wobble (seeded off the
+  // robot's id, not Math.random) mapped through a hysteresis tracker into a
+  // discrete green/amber/red state every frame. Both live purely in refs;
+  // see commsDrop.ts for the pure math this drives.
+  const commsPhase = useMemo(() => commsDropPhaseForRobot(robot.id), [robot.id]);
+  const commsTrackerRef = useRef(createCommsDropTracker());
+
+  // Last rendered [x, z] - kept up to date whenever the link is NOT "red",
+  // and simply left alone (never overwritten) while "red" so the robot
+  // visually holds at its last-known spot instead of teleporting once the
+  // link recovers. `distanceRef` above keeps accumulating regardless, so
+  // resuming is a smooth continuation of the same path progress, not a jump.
+  const lastKnownPosRef = useRef<[number, number]>([...robot.basePosition]);
+  const trailRef = useRef<Float32Array>(new Float32Array(TRAIL_LENGTH * 3));
+  const trailInitializedRef = useRef(false);
+
+  // Initial trail geometry - a degenerate loop of TRAIL_LENGTH copies of the
+  // base position, immediately overwritten frame-by-frame once mounted.
+  // Only computed once per robot (pure, deterministic), matching the
+  // "precompute once, mutate imperatively" pattern CommsLink already uses.
+  const initialTrailPoints = useMemo<Array<[number, number, number]>>(
+    () =>
+      Array.from({ length: TRAIL_LENGTH }, () => [
+        robot.basePosition[0],
+        0,
+        robot.basePosition[1],
+      ]),
+    [robot.basePosition]
+  );
 
   // Publish this robot's live THREE.Group once mounted (not per-frame) so
   // CommsLinks / SurvivorMarker elsewhere in the tree can read its actual
@@ -568,12 +647,36 @@ function RobotUnit({
   }, [robot.id, robotObjectsRef]);
 
   useFrame(({ clock }, delta) => {
+    const elapsed = clock.getElapsedTime();
+
+    // Path progress always keeps accumulating, even while the rendered
+    // position below is frozen - so recovery resumes smoothly instead of
+    // skipping ahead to "catch up".
     distanceRef.current += delta * robot.speed;
-    const [x, z] = sampleRobotPosition(robot, distanceRef.current);
+    const [pathX, pathZ] = sampleRobotPosition(robot, distanceRef.current);
+
+    const quality = commsQualityAt(elapsed, commsPhase);
+    const commsState = updateCommsDropTracker(commsTrackerRef.current, quality, elapsed);
+    commsStateRef.current[robot.id] = commsState;
+
+    // Position freezes on the map while disconnected ("red") - hold at the
+    // last-known spot rather than silently continuing to move.
+    let x: number;
+    let z: number;
+    if (commsState === "red") {
+      [x, z] = lastKnownPosRef.current;
+    } else {
+      x = pathX;
+      z = pathZ;
+      lastKnownPosRef.current[0] = x;
+      lastKnownPosRef.current[1] = z;
+    }
     const groundY = map.getElevation(x, z);
 
     // Keep clearing fog every frame regardless of whether the radius ring
     // is currently shown - the toggle only affects the visual, not the sim.
+    // Uses the same (possibly frozen) position as everything else below,
+    // so a disconnected robot's sensor feed reads as stale too.
     revealFogAround(fog, x, z, robot.radius, delta);
 
     // Publish the live position for the HUD telemetry pass (TelemetryTracker)
@@ -582,41 +685,98 @@ function RobotUnit({
 
     if (groupRef.current) groupRef.current.position.set(x, groundY, z);
     if (bodyRef.current) {
-      bodyRef.current.position.y = 0.48 + Math.sin(clock.getElapsedTime() * 3 + phase) * ROBOT_BOB_AMPLITUDE;
+      bodyRef.current.position.y = 0.48 + Math.sin(elapsed * 3 + phase) * ROBOT_BOB_AMPLITUDE;
+    }
+
+    // Tint the body material toward amber/red as the link degrades, on top
+    // of the robot's own base color - purely a visual consistency touch.
+    if (bodyMaterialRef.current) {
+      const tintAmount = commsState === "green" ? 0 : commsState === "amber" ? 0.4 : 0.7;
+      const tintTarget = commsState === "red" ? COMMS_TINT_RED : COMMS_TINT_AMBER;
+      tintScratch.copy(color).lerp(tintTarget, tintAmount);
+      const ease = 1 - Math.exp(-delta * BODY_TINT_EASE_RATE);
+      bodyMaterialRef.current.color.lerp(tintScratch, ease);
+      bodyMaterialRef.current.emissive.lerp(tintScratch, ease);
+    }
+
+    // Stale-path trail - a short ring buffer of recent rendered positions,
+    // only actually shown (faded in) while amber/red so connected robots
+    // don't clutter the view with trails.
+    const trail = trailRef.current;
+    if (!trailInitializedRef.current) {
+      for (let i = 0; i < TRAIL_LENGTH; i++) {
+        trail[i * 3] = x;
+        trail[i * 3 + 1] = groundY + TRAIL_HEIGHT_OFFSET;
+        trail[i * 3 + 2] = z;
+      }
+      trailInitializedRef.current = true;
+    } else {
+      trail.copyWithin(0, 3);
+      trail[(TRAIL_LENGTH - 1) * 3] = x;
+      trail[(TRAIL_LENGTH - 1) * 3 + 1] = groundY + TRAIL_HEIGHT_OFFSET;
+      trail[(TRAIL_LENGTH - 1) * 3 + 2] = z;
+    }
+    const trailLine = trailLineRef.current;
+    if (trailLine) {
+      trailLine.geometry.setPositions(Array.from(trail));
+      trailLine.computeLineDistances();
+      const targetOpacity = commsState === "green" ? 0 : commsState === "amber" ? 0.4 : 0.75;
+      const ease = 1 - Math.exp(-delta * TRAIL_OPACITY_EASE_RATE);
+      trailLine.material.opacity += (targetOpacity - trailLine.material.opacity) * ease;
+      trailLine.material.color.set(commsState === "red" ? PALETTE.commsLost : PALETTE.commsDegraded);
     }
   });
 
   return (
-    <group ref={groupRef} userData={{ entityType: "robot", entityId: robot.id }}>
-      <mesh ref={bodyRef} castShadow>
-        <boxGeometry args={[0.6, 0.4, 0.85]} />
-        <meshStandardMaterial
-          color={color}
-          emissive={color}
-          emissiveIntensity={0.85}
-          roughness={0.35}
-          metalness={0.5}
-        />
-      </mesh>
-      <mesh position={[0, 0.82, 0]}>
-        <coneGeometry args={[0.22, 0.3, 4]} />
-        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={1.5} roughness={0.3} />
-      </mesh>
-      <pointLight color={robot.color} intensity={1.8} distance={6} decay={2} />
+    <>
+      <group ref={groupRef} userData={{ entityType: "robot", entityId: robot.id }}>
+        <mesh ref={bodyRef} castShadow>
+          <boxGeometry args={[0.6, 0.4, 0.85]} />
+          <meshStandardMaterial
+            ref={bodyMaterialRef}
+            color={color}
+            emissive={color}
+            emissiveIntensity={0.85}
+            roughness={0.35}
+            metalness={0.5}
+          />
+        </mesh>
+        <mesh position={[0, 0.82, 0]}>
+          <coneGeometry args={[0.22, 0.3, 4]} />
+          <meshStandardMaterial color={color} emissive={color} emissiveIntensity={1.5} roughness={0.3} />
+        </mesh>
+        <pointLight color={robot.color} intensity={1.8} distance={6} decay={2} />
 
-      {showRadius && (
-        <group position={[0, 0.06, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <mesh>
-            <circleGeometry args={[robot.radius, 48]} />
-            <meshBasicMaterial color={color} transparent opacity={0.06} depthWrite={false} side={THREE.DoubleSide} />
-          </mesh>
-          <mesh>
-            <ringGeometry args={[robot.radius * 0.95, robot.radius, 64]} />
-            <meshBasicMaterial color={color} transparent opacity={0.55} depthWrite={false} side={THREE.DoubleSide} />
-          </mesh>
-        </group>
-      )}
-    </group>
+        {showRadius && (
+          <group position={[0, 0.06, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <mesh>
+              <circleGeometry args={[robot.radius, 48]} />
+              <meshBasicMaterial color={color} transparent opacity={0.06} depthWrite={false} side={THREE.DoubleSide} />
+            </mesh>
+            <mesh>
+              <ringGeometry args={[robot.radius * 0.95, robot.radius, 64]} />
+              <meshBasicMaterial color={color} transparent opacity={0.55} depthWrite={false} side={THREE.DoubleSide} />
+            </mesh>
+          </group>
+        )}
+      </group>
+
+      {/* Stale last-known-path trail - geometry mutated imperatively every
+          frame above; opacity stays ~0 (invisible) while connected. */}
+      <Line
+        ref={trailLineRef}
+        points={initialTrailPoints}
+        color={PALETTE.commsDegraded}
+        lineWidth={1.3}
+        dashed
+        dashScale={3}
+        dashSize={1.3}
+        gapSize={1}
+        transparent
+        opacity={0}
+        depthWrite={false}
+      />
+    </>
   );
 }
 
@@ -627,6 +787,7 @@ function RescueRobots({
   showRadius,
   positionsRef,
   robotObjectsRef,
+  commsStateRef,
 }: {
   robots: RescueRobot[];
   map: GeneratedDisasterMap;
@@ -634,6 +795,7 @@ function RescueRobots({
   showRadius: boolean;
   positionsRef: MutableRefObject<RobotPositions>;
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  commsStateRef: MutableRefObject<RobotCommsStates>;
 }) {
   return (
     <>
@@ -646,6 +808,7 @@ function RescueRobots({
           showRadius={showRadius}
           positionsRef={positionsRef}
           robotObjectsRef={robotObjectsRef}
+          commsStateRef={commsStateRef}
         />
       ))}
     </>
@@ -673,10 +836,12 @@ function CommsLink({
   a,
   b,
   robotObjectsRef,
+  commsStateRef,
 }: {
   a: RescueRobot;
   b: RescueRobot;
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  commsStateRef: MutableRefObject<RobotCommsStates>;
 }) {
   const lineRef = useRef<Line2 | null>(null);
   const phase = useMemo(() => phaseFromId(`${a.id}~${b.id}`) * Math.PI * 2, [a.id, b.id]);
@@ -696,7 +861,19 @@ function CommsLink({
       objB.position.z,
     ]);
     line.computeLineDistances();
-    line.material.dashOffset -= delta * COMMS_DASH_SPEED;
+
+    // A disconnected endpoint realistically wouldn't have a working comms
+    // link either - render the beam as dim/broken (dash animation stalls,
+    // reading as "stuck") and tint it toward the worse of the two robots'
+    // states, rather than pretending the link is still nominal.
+    const stateA = commsStateRef.current[a.id] ?? "green";
+    const stateB = commsStateRef.current[b.id] ?? "green";
+    const worstState: CommsLinkState =
+      stateA === "red" || stateB === "red" ? "red" : stateA === "amber" || stateB === "amber" ? "amber" : "green";
+
+    if (worstState !== "red") {
+      line.material.dashOffset -= delta * COMMS_DASH_SPEED;
+    }
 
     const dist = Math.hypot(objA.position.x - objB.position.x, objA.position.z - objB.position.z);
     const proximity = THREE.MathUtils.clamp(1 - dist / COMMS_COORDINATION_RANGE, 0, 1);
@@ -704,7 +881,13 @@ function CommsLink({
     // Never fully fades out (min ~0.12) so the "fleet is coordinating" read
     // stays legible even when two units are at opposite ends of the map;
     // it just gets noticeably brighter/livelier the closer they roam.
-    line.material.opacity = 0.12 + proximity * 0.5 + pulse * 0.14;
+    let opacity = 0.12 + proximity * 0.5 + pulse * 0.14;
+    if (worstState === "amber") opacity *= 0.65;
+    if (worstState === "red") opacity *= 0.3;
+    line.material.opacity = opacity;
+    line.material.color.set(
+      worstState === "red" ? COMMS_LINK_COLOR_RED : worstState === "amber" ? COMMS_LINK_COLOR_AMBER : PALETTE.commsLink
+    );
   });
 
   return (
@@ -730,9 +913,11 @@ function CommsLink({
 function CommsLinks({
   robots,
   robotObjectsRef,
+  commsStateRef,
 }: {
   robots: RescueRobot[];
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  commsStateRef: MutableRefObject<RobotCommsStates>;
 }) {
   const pairs = useMemo(() => {
     const list: Array<{ a: RescueRobot; b: RescueRobot; key: string }> = [];
@@ -747,7 +932,7 @@ function CommsLinks({
   return (
     <>
       {pairs.map(({ a, b, key }) => (
-        <CommsLink key={key} a={a} b={b} robotObjectsRef={robotObjectsRef} />
+        <CommsLink key={key} a={a} b={b} robotObjectsRef={robotObjectsRef} commsStateRef={commsStateRef} />
       ))}
     </>
   );
@@ -853,6 +1038,7 @@ function Scene({
   onEntityClick,
   positionsRef,
   robotObjectsRef,
+  commsStateRef,
   escortRef,
   cellEntities,
   sessionStartRef,
@@ -868,6 +1054,7 @@ function Scene({
   onEntityClick?: (entity: MapEntity) => void;
   positionsRef: MutableRefObject<RobotPositions>;
   robotObjectsRef: MutableRefObject<RobotObjectRefs>;
+  commsStateRef: MutableRefObject<RobotCommsStates>;
   escortRef: MutableRefObject<SurvivorEscortMap>;
   cellEntities: Map<number, MapEntity[]>;
   sessionStartRef: MutableRefObject<number>;
@@ -940,14 +1127,16 @@ function Scene({
         showRadius={showExplorationRadius}
         positionsRef={positionsRef}
         robotObjectsRef={robotObjectsRef}
+        commsStateRef={commsStateRef}
       />
-      <CommsLinks robots={robots} robotObjectsRef={robotObjectsRef} />
+      <CommsLinks robots={robots} robotObjectsRef={robotObjectsRef} commsStateRef={commsStateRef} />
       <FogOfWar map={map} fog={fog} />
       <TelemetryTracker
         map={map}
         robots={robots}
         fog={fog}
         positionsRef={positionsRef}
+        commsStateRef={commsStateRef}
         cellEntities={cellEntities}
         sessionStartRef={sessionStartRef}
         escortRef={escortRef}
@@ -1039,6 +1228,11 @@ export default function DisasterMap3D({
   // mount effect) and read every frame by CommsLinks/SurvivorMarker for
   // their own imperative position updates - see RobotObjectRefs above.
   const robotObjectsRef = useRef<RobotObjectRefs>({});
+  // Live per-robot comms-link health (green/amber/red), written every frame
+  // by RobotUnit's comms-drop simulation and read by CommsLinks (to render
+  // broken/dashed links) and TelemetryTracker (to report it up to the HUD
+  // at the usual throttled cadence) - see commsDrop.ts.
+  const commsStateRef = useRef<RobotCommsStates>({});
   // Which robot is escorting each found survivor, written once by
   // TelemetryTracker the moment a survivor is revealed - see
   // SurvivorEscortMap's doc comment in telemetry.ts.
@@ -1063,6 +1257,7 @@ export default function DisasterMap3D({
   useEffect(() => {
     sessionStartRef.current = Date.now();
     positionsRef.current = {};
+    commsStateRef.current = {};
   }, [seed]);
 
   return (
@@ -1084,6 +1279,7 @@ export default function DisasterMap3D({
           onEntityClick={onEntityClick}
           positionsRef={positionsRef}
           robotObjectsRef={robotObjectsRef}
+          commsStateRef={commsStateRef}
           escortRef={escortRef}
           cellEntities={cellEntities}
           sessionStartRef={sessionStartRef}

@@ -9,7 +9,7 @@
  */
 
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { AlertTriangle, Blocks, HeartPulse, X } from "lucide-react";
+import { AlertTriangle, Blocks, HeartPulse, Radio, X } from "lucide-react";
 import type { FeedEntry, FeedKind, FeedSeverity } from "@/components/disaster-map/telemetry";
 import { formatElapsedClock } from "./format";
 
@@ -29,6 +29,7 @@ function KindIcon({ kind }: { kind: FeedKind }) {
   const className = "h-3.5 w-3.5";
   if (kind === "survivor") return <HeartPulse className={className} aria-hidden="true" />;
   if (kind === "hazard") return <AlertTriangle className={className} aria-hidden="true" />;
+  if (kind === "command") return <Radio className={className} aria-hidden="true" />;
   return <Blocks className={className} aria-hidden="true" />;
 }
 

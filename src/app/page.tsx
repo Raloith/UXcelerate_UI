@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Activity,
@@ -18,15 +18,19 @@ import type {
   FeedEntry,
   GeneratedDisasterMap,
   MapEntity,
+  QueuedCommand,
+  QueuedCommandKind,
   RescueRobot,
   RobotTelemetry,
   TelemetrySnapshot,
 } from "@/components/disaster-map/DisasterMap3D";
+import { CANNED_COMMANDS, makeCommandExecutedFeedEntry } from "@/components/disaster-map/DisasterMap3D";
 import SeedControlPanel from "@/components/disaster-map/SeedControlPanel";
 import TopHudBar from "@/components/hud/TopHudBar";
 import RobotFleetDrawer from "@/components/hud/RobotFleetDrawer";
 import HazardFeedDrawer from "@/components/hud/HazardFeedDrawer";
 import FilterTogglesBar from "@/components/hud/FilterTogglesBar";
+import CommandToasts, { type CommandToast } from "@/components/hud/CommandToasts";
 import { useCommsStability } from "@/components/hud/useCommsStability";
 
 const DisasterMap3D = dynamic(
@@ -42,9 +46,18 @@ interface TelemetryState {
   survivorsFound: number;
   survivorsTotal: number;
   robots: RobotTelemetry[];
+  elapsedSeconds: number;
 }
 
-const EMPTY_TELEMETRY: TelemetryState = { survivorsFound: 0, survivorsTotal: 0, robots: [] };
+const EMPTY_TELEMETRY: TelemetryState = {
+  survivorsFound: 0,
+  survivorsTotal: 0,
+  robots: [],
+  elapsedSeconds: 0,
+};
+
+/** Pending Emergency Beacon command per robot, keyed by robot id. */
+type QueuedCommandsState = Record<string, QueuedCommand | undefined>;
 
 export default function Home() {
   const [seed, setSeed] = useState(DEFAULT_SEED);
@@ -66,7 +79,30 @@ export default function Home() {
   const [telemetry, setTelemetry] = useState<TelemetryState>(EMPTY_TELEMETRY);
   const [feedLog, setFeedLog] = useState<FeedEntry[]>([]);
 
+  // Emergency Beacon: operator-queued commands per robot, and their
+  // toast confirmations. Session/operator state, not part of the 3D
+  // telemetry pipeline - lives here rather than in DisasterMap3D.
+  const [queuedCommands, setQueuedCommands] = useState<QueuedCommandsState>({});
+  const [toasts, setToasts] = useState<CommandToast[]>([]);
+  // Mirrors `queuedCommands` for the throttled telemetry callback below to
+  // read without needing to be re-created every time the state changes.
+  const queuedCommandsRef = useRef<QueuedCommandsState>({});
+  const toastSeqRef = useRef(0);
+  const commandFeedSeqRef = useRef(0);
+
+  useEffect(() => {
+    queuedCommandsRef.current = queuedCommands;
+  }, [queuedCommands]);
+
   const comms = useCommsStability(seed);
+
+  const pushToast = useCallback((message: string) => {
+    const id = `toast-${toastSeqRef.current++}`;
+    setToasts((prev) => [...prev, { id, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3600);
+  }, []);
 
   const handleGenerated = useCallback((generated: GeneratedDisasterMap) => {
     setMap(generated);
@@ -85,11 +121,41 @@ export default function Home() {
       survivorsFound: snapshot.survivorsFound,
       survivorsTotal: snapshot.survivorsTotal,
       robots: snapshot.robots,
+      elapsedSeconds: snapshot.elapsedSeconds,
     });
     if (snapshot.newFeedEntries.length > 0) {
       setFeedLog((prev) =>
         [...snapshot.newFeedEntries].reverse().concat(prev).slice(0, FEED_LOG_CAP)
       );
+    }
+
+    // Resolve any queued Emergency Beacon commands whose target robot's
+    // link just came back up (green) - "execute" = log a feed entry and
+    // clear the pending command, per the queued-command lifecycle spec.
+    const queued = queuedCommandsRef.current;
+    const executedRobotIds: string[] = [];
+    const executedEntries: FeedEntry[] = [];
+    for (const robotTelemetry of snapshot.robots) {
+      const command = queued[robotTelemetry.id];
+      if (command && robotTelemetry.commsState === "green") {
+        executedEntries.push(
+          makeCommandExecutedFeedEntry(
+            robotTelemetry,
+            command,
+            snapshot.elapsedSeconds,
+            commandFeedSeqRef.current++
+          )
+        );
+        executedRobotIds.push(robotTelemetry.id);
+      }
+    }
+    if (executedEntries.length > 0) {
+      setFeedLog((prev) => [...executedEntries].reverse().concat(prev).slice(0, FEED_LOG_CAP));
+      setQueuedCommands((prev) => {
+        const next = { ...prev };
+        for (const id of executedRobotIds) delete next[id];
+        return next;
+      });
     }
   }, []);
 
@@ -101,7 +167,47 @@ export default function Home() {
     // of showing the previous seed's stale found-count/feed log.
     setTelemetry(EMPTY_TELEMETRY);
     setFeedLog([]);
+    setQueuedCommands({});
+    setToasts([]);
   }, []);
+
+  const handleDispatchCommand = useCallback(
+    (robotId: string, kind: QueuedCommandKind) => {
+      const robot = telemetry.robots.find((r) => r.id === robotId);
+      const label = CANNED_COMMANDS.find((c) => c.kind === kind)?.label ?? kind;
+      const robotLabel = robot?.label ?? robotId;
+      setQueuedCommands((prev) => ({
+        ...prev,
+        [robotId]: { robotId, kind, label, queuedAtSeconds: telemetry.elapsedSeconds },
+      }));
+      pushToast(`Command queued for ${robotLabel} — will execute on reconnect: ${label.toUpperCase()}.`);
+    },
+    [telemetry.robots, telemetry.elapsedSeconds, pushToast]
+  );
+
+  const handleBroadcastCommand = useCallback(
+    (kind: QueuedCommandKind) => {
+      const label = CANNED_COMMANDS.find((c) => c.kind === kind)?.label ?? kind;
+      const targets = telemetry.robots.filter(
+        (r) => r.commsState !== "green" && !queuedCommandsRef.current[r.id]
+      );
+      if (targets.length === 0) {
+        pushToast("All units already nominal or have a command pending — nothing to broadcast.");
+        return;
+      }
+      setQueuedCommands((prev) => {
+        const next = { ...prev };
+        for (const r of targets) {
+          next[r.id] = { robotId: r.id, kind, label, queuedAtSeconds: telemetry.elapsedSeconds };
+        }
+        return next;
+      });
+      pushToast(
+        `Broadcast queued for ${targets.length} unit${targets.length === 1 ? "" : "s"} — will execute on reconnect: ${label.toUpperCase()}.`
+      );
+    },
+    [telemetry.robots, telemetry.elapsedSeconds, pushToast]
+  );
 
   const handleToggleRobotRadius = useCallback(() => {
     setShowRobotRadius((prev) => !prev);
@@ -143,10 +249,20 @@ export default function Home() {
       </div>
 
       {/* Left drawer: Robot Fleet Status */}
-      <RobotFleetDrawer open={fleetOpen} onClose={() => setFleetOpen(false)} robots={telemetry.robots} />
+      <RobotFleetDrawer
+        open={fleetOpen}
+        onClose={() => setFleetOpen(false)}
+        robots={telemetry.robots}
+        queuedCommands={queuedCommands}
+        onDispatchCommand={handleDispatchCommand}
+        onBroadcastCommand={handleBroadcastCommand}
+      />
 
       {/* Right drawer: Live Hazard & Survivor Feed */}
       <HazardFeedDrawer open={feedOpen} onClose={() => setFeedOpen(false)} entries={feedLog} />
+
+      {/* Emergency Beacon dispatch/broadcast confirmations */}
+      <CommandToasts toasts={toasts} />
 
       {/* Bottom chrome: quick filters + stats HUD */}
       <motion.div

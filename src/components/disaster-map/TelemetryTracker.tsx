@@ -23,6 +23,7 @@ import type { MutableRefObject } from "react";
 import type { GeneratedDisasterMap, MapEntity } from "./generateDisasterMap";
 import type { FogOfWarState } from "./fogOfWar";
 import type { RescueRobot } from "./robots";
+import type { RobotCommsStates } from "./commsDrop";
 import {
   computeRobotTelemetry,
   makeFeedEntry,
@@ -40,6 +41,8 @@ export interface TelemetryTrackerProps {
   robots: RescueRobot[];
   fog: FogOfWarState;
   positionsRef: MutableRefObject<RobotPositions>;
+  /** Live per-robot comms-link state (green/amber/red), written every frame by RobotUnit's comms-drop simulation - read here (throttled) to fold into each robot's telemetry row. */
+  commsStateRef: MutableRefObject<RobotCommsStates>;
   /** One-time reverse lookup: fog cell index -> hazard/blocked-path/survivor entities sitting in it. */
   cellEntities: Map<number, MapEntity[]>;
   /** Wall-clock `Date.now()` this seed's session started, reset by the caller whenever `seed` changes. */
@@ -59,6 +62,7 @@ export default function TelemetryTracker({
   robots,
   fog,
   positionsRef,
+  commsStateRef,
   cellEntities,
   sessionStartRef,
   escortRef,
@@ -135,7 +139,13 @@ export default function TelemetryTracker({
     lastFlushRef.current = nowMs;
 
     const robotsTelemetry = robots.map((r) =>
-      computeRobotTelemetry(r, positionsRef.current[r.id], map, elapsedSeconds)
+      computeRobotTelemetry(
+        r,
+        positionsRef.current[r.id],
+        map,
+        elapsedSeconds,
+        commsStateRef.current[r.id] ?? "green"
+      )
     );
     const newFeedEntries = pendingFeedRef.current;
     pendingFeedRef.current = [];

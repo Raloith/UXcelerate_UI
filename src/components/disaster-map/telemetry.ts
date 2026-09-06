@@ -13,6 +13,9 @@
 
 import type { GeneratedDisasterMap, MapEntity } from "./generateDisasterMap";
 import type { RescueRobot } from "./robots";
+import type { CommsLinkState } from "./commsDrop";
+
+export type { CommsLinkState } from "./commsDrop";
 
 /** Live [x, z] position for a robot, keyed by robot id. Written every frame by RobotUnit, read (throttled) by TelemetryTracker. */
 export type RobotPositions = Record<string, { x: number; z: number }>;
@@ -45,9 +48,39 @@ export interface RobotTelemetry {
   channelLabel: string;
   /** Seeded simulated comms frequency (MHz) for that channel. */
   channelFrequencyMHz: number;
+  /** Live simulated comms-link health (green/amber/red) - see commsDrop.ts. Computed per-frame on refs in the 3D layer, reported here at the same throttled cadence as the rest of this snapshot. */
+  commsState: CommsLinkState;
+  /** Rounded live (x, z) - the robot's *rendered* position, which holds at its last-known spot while `commsState` is "red" (see RobotUnit's freeze logic). Used for compact feed-entry display. */
+  position: [number, number];
 }
 
-export type FeedKind = "hazard" | "blocked-path" | "survivor";
+export type QueuedCommandKind =
+  | "RETURN_TO_BASE"
+  | "RESUME_PATROL"
+  | "PRIORITIZE_NEAREST_SURVIVOR";
+
+/** Small canned command set for the Emergency Beacon dispatch control - cosmetic/narrative payload only, see QueuedCommand's doc comment. */
+export const CANNED_COMMANDS: ReadonlyArray<{ kind: QueuedCommandKind; label: string }> = [
+  { kind: "RETURN_TO_BASE", label: "Return to Base" },
+  { kind: "RESUME_PATROL", label: "Resume Patrol" },
+  { kind: "PRIORITIZE_NEAREST_SURVIVOR", label: "Prioritize Nearest Survivor" },
+];
+
+/**
+ * An operator-queued command for one robot, dispatched via the Emergency
+ * Beacon control while that robot's link is amber/red. Purely
+ * cosmetic/narrative - "executing" it never alters robot behavior, it just
+ * logs a feed entry (see `makeCommandExecutedFeedEntry`) and clears once
+ * the target robot's `commsState` transitions back to "green".
+ */
+export interface QueuedCommand {
+  robotId: string;
+  kind: QueuedCommandKind;
+  label: string;
+  queuedAtSeconds: number;
+}
+
+export type FeedKind = "hazard" | "blocked-path" | "survivor" | "command";
 export type FeedSeverity = "info" | "warning" | "critical";
 
 export interface FeedEntry {
@@ -124,7 +157,8 @@ export function computeRobotTelemetry(
   robot: RescueRobot,
   livePosition: { x: number; z: number } | undefined,
   map: GeneratedDisasterMap,
-  elapsedSeconds: number
+  elapsedSeconds: number,
+  commsState: CommsLinkState
 ): RobotTelemetry {
   const x = livePosition?.x ?? robot.basePosition[0];
   const z = livePosition?.z ?? robot.basePosition[1];
@@ -157,6 +191,28 @@ export function computeRobotTelemetry(
     task: deriveRobotTask(map, x, z, distanceFromBase),
     channelLabel: robot.channelLabel,
     channelFrequencyMHz: robot.channelFrequencyMHz,
+    commsState,
+    position: [Math.round(x), Math.round(z)],
+  };
+}
+
+/** Build the feed entry logged when a queued Emergency Beacon command "executes" the moment its target robot's link is restored to green. */
+export function makeCommandExecutedFeedEntry(
+  robot: RobotTelemetry,
+  command: QueuedCommand,
+  elapsedSeconds: number,
+  seq: number
+): FeedEntry {
+  return {
+    id: `feed-cmd-${seq}-${robot.id}`,
+    timestampSeconds: elapsedSeconds,
+    robotLabel: robot.label,
+    channelLabel: robot.channelLabel,
+    kind: "command",
+    title: "LINK RESTORED",
+    detail: `EXECUTING QUEUED COMMAND: ${command.label.toUpperCase()}`,
+    position: robot.position,
+    severity: "info",
   };
 }
 
