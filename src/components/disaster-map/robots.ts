@@ -50,6 +50,38 @@ export interface RescueRobot {
   channelFrequencyMHz: number;
 }
 
+/** Clamp `v` to the inclusive [min, max] range. */
+function clamp(v: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, v));
+}
+
+/** Normalize an angle (radians) into [0, 2π). */
+function normalizeAngle(angle: number): number {
+  const twoPi = Math.PI * 2;
+  let a = angle % twoPi;
+  if (a < 0) a += twoPi;
+  return a;
+}
+
+/** True if normalized `angle` falls in the half-open arc [start, start + span), wrapping past 2π correctly. */
+function isAngleInSector(angle: number, start: number, span: number): boolean {
+  return normalizeAngle(angle - start) < span;
+}
+
+/**
+ * Minimum number of candidate points a robot's assigned map sector should
+ * have before its patrol tour is considered "well distributed". Below
+ * this, fallbacks kick in (borrow from neighboring sectors, then
+ * synthesize deterministic points) so every robot still gets a reasonable
+ * loop regardless of how the seeded map's entities happen to cluster.
+ */
+const MIN_ZONE_CANDIDATES = 8;
+/** Hard cap on synthetic (non-entity) fallback waypoints per robot, so a totally empty sector still gets bounded extra work. */
+const MAX_SYNTHETIC_WAYPOINTS = 8;
+/** Radius band (meters from base) used when synthesizing fallback waypoints directly from map coordinates. */
+const SYNTHETIC_RADIUS_MIN = 18;
+const SYNTHETIC_RADIUS_MARGIN_FROM_EDGE = 10;
+
 /**
  * Generate 3-4 deterministic rescue robots for a seed: shared home base
  * (with small per-robot jitter), each patrolling a seeded closed loop built
@@ -57,17 +89,40 @@ export interface RescueRobot {
  * survivors), so paths always stay plausible and reachable. Uses its own
  * derived RNG stream (`${seed}::robots`) so this never disturbs (or is
  * disturbed by) the main map generation stream.
+ *
+ * To keep the fleet spread out instead of retreading the same ground, the
+ * map is first split into `count` equal angular sectors (wedges) around
+ * the shared base, with a small seeded rotation so the fan-out orientation
+ * still varies per seed. Each robot is assigned one distinct wedge and its
+ * waypoint tour is built almost entirely from candidate points (routes /
+ * rubble / survivors) that fall inside that wedge - so robots naturally
+ * patrol different regions of the map rather than sampling from one
+ * shared, unpartitioned pool. If a robot's wedge is too sparse (uneven
+ * entity distribution for a given seed), it first borrows the closest
+ * points from neighboring wedges, then - if still short - synthesizes a
+ * few extra deterministic waypoints spread across its own wedge directly
+ * from map coordinates, so no robot ever gets stranded with a degenerate
+ * loop.
  */
 export function generateRobots(seed: string, map: GeneratedDisasterMap): RescueRobot[] {
   const rng = createSeededRNG(`${seed}::robots`);
   const count = rng.int(3, 4);
 
+  // Deliberately not sliced down to a small handful - the fuller the pool,
+  // the more likely every angular wedge below has enough real candidates
+  // to draw a tour from without needing synthetic fallback points.
   const interestPoints: Array<[number, number]> = [
     ...map.routes.map((r) => [r.position[0], r.position[2]] as [number, number]),
-    ...map.rubble.slice(0, 14).map((r) => [r.position[0], r.position[2]] as [number, number]),
-    ...map.survivors.slice(0, 12).map((s) => [s.position[0], s.position[2]] as [number, number]),
+    ...map.rubble.map((r) => [r.position[0], r.position[2]] as [number, number]),
+    ...map.survivors.map((s) => [s.position[0], s.position[2]] as [number, number]),
   ];
   if (interestPoints.length === 0) interestPoints.push(ROBOT_BASE);
+
+  // --- Spatial partition: one distinct angular sector per robot ----------
+  const sectorSpan = (Math.PI * 2) / count;
+  const sectorRotation = rng.range(0, Math.PI * 2);
+  const angleFromBase = (p: [number, number]) =>
+    normalizeAngle(Math.atan2(p[1] - ROBOT_BASE[1], p[0] - ROBOT_BASE[0]));
 
   const robots: RescueRobot[] = [];
   for (let n = 0; n < count; n++) {
@@ -76,11 +131,62 @@ export function generateRobots(seed: string, map: GeneratedDisasterMap): RescueR
       ROBOT_BASE[1] + rng.range(-3, 3),
     ];
 
+    const sectorStart = sectorRotation + n * sectorSpan;
+
+    // Primary candidates: real map points whose angle from base lands
+    // inside this robot's own wedge.
+    const zonePoints: Array<[number, number]> = interestPoints.filter((p) =>
+      isAngleInSector(angleFromBase(p), sectorStart, sectorSpan)
+    );
+
+    // Fallback 1: this wedge is sparse - borrow the angularly-closest
+    // points from neighboring wedges rather than leaving the tour thin.
+    if (zonePoints.length < MIN_ZONE_CANDIDATES) {
+      const zoneSet = new Set(zonePoints);
+      const borrowed = interestPoints
+        .filter((p) => !zoneSet.has(p))
+        .map((p) => {
+          const rel = normalizeAngle(angleFromBase(p) - sectorStart);
+          const overshoot = rel - sectorSpan; // how far past this wedge's far edge
+          const distance = Math.min(overshoot, Math.PI * 2 - rel); // or wrap the other way, toward the near edge
+          return { p, distance };
+        })
+        .sort((a, b) => a.distance - b.distance);
+      for (const { p } of borrowed) {
+        if (zonePoints.length >= MIN_ZONE_CANDIDATES) break;
+        zonePoints.push(p);
+      }
+    }
+
+    // Fallback 2: still sparse (e.g. a wedge that mostly points off the
+    // edge of the map near the base) - synthesize a few extra deterministic
+    // waypoints spread across this wedge's own angle/radius range directly
+    // from map coordinates, clamped to stay on the map.
+    let synthesized = 0;
+    while (zonePoints.length < MIN_ZONE_CANDIDATES && synthesized < MAX_SYNTHETIC_WAYPOINTS) {
+      const angle = sectorStart + rng.next() * sectorSpan;
+      const radius = rng.range(SYNTHETIC_RADIUS_MIN, MAP_HALF - SYNTHETIC_RADIUS_MARGIN_FROM_EDGE);
+      const edge = MAP_HALF - 6;
+      const x = clamp(ROBOT_BASE[0] + Math.cos(angle) * radius, -edge, edge);
+      const z = clamp(ROBOT_BASE[1] + Math.sin(angle) * radius, -edge, edge);
+      zonePoints.push([x, z]);
+      synthesized++;
+    }
+
     const stopCount = rng.int(5, 8);
     const stops: Array<[number, number]> = [];
     for (let s = 0; s < stopCount; s++) {
-      stops.push(rng.pick(interestPoints));
+      stops.push(rng.pick(zonePoints));
     }
+    // Order stops by distance from base so the loop sweeps outward through
+    // the robot's own wedge and back, instead of zigzagging between
+    // near/far picks in an arbitrary order (which reads as jittery,
+    // crossing-over motion rather than a clean patrol sweep).
+    stops.sort(
+      (a, b) =>
+        Math.hypot(a[0] - basePosition[0], a[1] - basePosition[1]) -
+        Math.hypot(b[0] - basePosition[0], b[1] - basePosition[1])
+    );
 
     const waypoints = [basePosition, ...stops];
     let pathLength = 0;
